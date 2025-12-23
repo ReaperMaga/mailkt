@@ -11,4 +11,6 @@ data class OAuth2MailUser(
     val username: String? = null,
     val accessToken: String? = null,
     val error: Throwable? = null
-)
+) {
+    val success get() = error == null && username != null && accessToken != null
+}

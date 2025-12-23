@@ -20,4 +20,6 @@ data class MailConnection(
     val session: Session? = null,
     val store: IMAPStore? = null,
     val error: Throwable? = null
-)
+) {
+    val success get() = error == null && session != null && store != null
+}

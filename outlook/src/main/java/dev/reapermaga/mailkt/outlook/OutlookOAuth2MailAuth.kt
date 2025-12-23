@@ -7,7 +7,8 @@ import dev.reapermaga.mailkt.auth.OAuth2MailUser
 import java.util.concurrent.CompletableFuture
 import java.util.function.Consumer
 
-class OutlookOAuth2MailAuth(val clientId: String, val verificationConsumer: Consumer<OutlookOAuth2Verification>) : OAuth2MailAuth {
+class OutlookOAuth2MailAuth(val clientId: String, val verificationConsumer: Consumer<OutlookOAuth2Verification>) :
+    OAuth2MailAuth {
     private val authority = "https://login.microsoftonline.com/consumers"
     private val scope = "https://outlook.office.com/IMAP.AccessAsUser.All"
 
@@ -19,21 +20,18 @@ class OutlookOAuth2MailAuth(val clientId: String, val verificationConsumer: Cons
                 .build()
             val deviceParams = DeviceCodeFlowParameters
                 .builder(setOf(scope)) {
-                    verificationConsumer.accept(OutlookOAuth2Verification(
-                        verificationUri = it.verificationUri(),
-                        code = it.userCode()
-                    ))
+                    verificationConsumer.accept(
+                        OutlookOAuth2Verification(
+                            verificationUri = it.verificationUri(),
+                            code = it.userCode()
+                        )
+                    )
                 }
                 .build()
             val future = CompletableFuture<OAuth2MailUser>()
             val tokenFuture = app.acquireToken(deviceParams)
             tokenFuture.exceptionally {
-                it.printStackTrace()
-                future.complete(
-                    OAuth2MailUser(
-                        error = it
-                    )
-                )
+                future.complete(OAuth2MailUser(error = it))
                 null
             }
             tokenFuture.thenAccept { result ->
@@ -48,14 +46,13 @@ class OutlookOAuth2MailAuth(val clientId: String, val verificationConsumer: Cons
             }
             return future
         } catch (ex: Exception) {
-            val future = CompletableFuture<OAuth2MailUser>()
-            future.complete(
+            return CompletableFuture.completedFuture(
                 OAuth2MailUser(
                     error = ex
                 )
             )
-            return future
         }
+
     }
 }
 
