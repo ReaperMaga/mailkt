@@ -4,8 +4,12 @@ import com.microsoft.aad.msal4j.InteractiveRequestParameters
 import com.microsoft.aad.msal4j.PublicClientApplication
 import com.sun.mail.imap.IMAPFolder
 import com.sun.mail.imap.IMAPStore
+import com.sun.mail.imap.IdleManager
 import jakarta.mail.Folder
+import jakarta.mail.MessagingException
 import jakarta.mail.Session
+import jakarta.mail.event.MessageCountAdapter
+import jakarta.mail.event.MessageCountEvent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -13,6 +17,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.future.asCompletableFuture
 import java.net.URI
 import java.util.Properties
+import java.util.concurrent.Executors
 
 
 fun main() {
@@ -37,6 +42,7 @@ fun main() {
     props["mail.imap.ssl.enable"] = "true";
     props["mail.imap.ssl.trust"] = "*";
     props["mail.imap.starttls.enable"] = "true"
+    props["mail.imap.usesocketchannels"] = "true";
 
     // OAuth2 settings
     props["mail.imap.auth.mechanisms"] = "XOAUTH2";
@@ -46,18 +52,24 @@ fun main() {
     val session = Session.getInstance(props)
     val store = session.getStore("imap") as IMAPStore
     store.connect(host, username, token)
+    val idleManager = IdleManager(session, Executors.newCachedThreadPool())
     val inbox = store.getFolder("INBOX") as IMAPFolder
     inbox.open(Folder.READ_ONLY)
-    println("Message count: ${inbox.messageCount}")
-    val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-    scope.async {
-        while (true) {
-            inbox.idle()
-            // Handle new messages or updates here
+
+    println("Connected to mailbox, waiting for new messages...")
+    inbox.addMessageCountListener(object : MessageCountAdapter() {
+        override fun messagesAdded(event: MessageCountEvent) {
+            val source = event.source as Folder
+            println("New message received! Total messages: ${source.messageCount}")
+            val latestMessage = source.getMessage(source.messageCount)
+            println("Subject: ${latestMessage.subject}")
+            println("From: ${latestMessage.from.joinToString()}")
+            try {
+                idleManager.watch(source)
+            } catch (ex: MessagingException) {
+               ex.printStackTrace()
+            }
         }
-    }.asCompletableFuture()
-
-
-
-
+    })
+    idleManager.watch(inbox)
 }
