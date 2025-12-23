@@ -1,12 +1,9 @@
 package dev.reapermaga.mailkt.outlook
 
 import com.microsoft.aad.msal4j.DeviceCodeFlowParameters
-import com.microsoft.aad.msal4j.InteractiveRequestParameters
 import com.microsoft.aad.msal4j.PublicClientApplication
-import com.microsoft.aad.msal4j.SilentParameters
-import dev.reapermaga.mailkt.provider.OAuth2MailAuth
-import dev.reapermaga.mailkt.provider.OAuth2MailUser
-import java.net.URI
+import dev.reapermaga.mailkt.auth.OAuth2MailAuth
+import dev.reapermaga.mailkt.auth.OAuth2MailUser
 import java.util.concurrent.CompletableFuture
 import java.util.function.Consumer
 

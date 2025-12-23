@@ -1,4 +1,4 @@
-package dev.reapermaga.mailkt.provider
+package dev.reapermaga.mailkt.auth
 
 enum class MailAuthMethod {
 

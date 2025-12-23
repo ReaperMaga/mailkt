@@ -1,6 +1,6 @@
 package dev.reapermaga.mailkt.outlook
 
-import dev.reapermaga.mailkt.provider.MailAuthMethod
+import dev.reapermaga.mailkt.auth.MailAuthMethod
 
 fun main() {
     val clientId = "<your-client-id-here>"

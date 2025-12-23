@@ -1,6 +1,7 @@
-package dev.reapermaga.mailkt.provider
+package dev.reapermaga.mailkt.session
 
 import com.sun.mail.imap.IMAPStore
+import dev.reapermaga.mailkt.auth.MailAuthMethod
 import jakarta.mail.Session
 import java.util.concurrent.CompletableFuture
 

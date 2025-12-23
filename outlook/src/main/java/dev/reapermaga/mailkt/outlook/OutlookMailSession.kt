@@ -1,9 +1,9 @@
 package dev.reapermaga.mailkt.outlook
 
 import com.sun.mail.imap.IMAPStore
-import dev.reapermaga.mailkt.provider.MailAuthMethod
-import dev.reapermaga.mailkt.provider.MailConnection
-import dev.reapermaga.mailkt.provider.MailSession
+import dev.reapermaga.mailkt.auth.MailAuthMethod
+import dev.reapermaga.mailkt.session.MailConnection
+import dev.reapermaga.mailkt.session.MailSession
 import dev.reapermaga.mailkt.util.JakartaPropertiesFactory
 import jakarta.mail.Session
 import kotlinx.coroutines.CoroutineScope
