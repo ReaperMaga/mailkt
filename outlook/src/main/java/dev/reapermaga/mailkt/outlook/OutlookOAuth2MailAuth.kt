@@ -1,13 +1,16 @@
 package dev.reapermaga.mailkt.outlook
 
+import com.microsoft.aad.msal4j.DeviceCodeFlowParameters
 import com.microsoft.aad.msal4j.InteractiveRequestParameters
 import com.microsoft.aad.msal4j.PublicClientApplication
+import com.microsoft.aad.msal4j.SilentParameters
 import dev.reapermaga.mailkt.provider.OAuth2MailAuth
 import dev.reapermaga.mailkt.provider.OAuth2MailUser
 import java.net.URI
 import java.util.concurrent.CompletableFuture
+import java.util.function.Consumer
 
-class OutlookOAuth2MailAuth(val clientId: String) : OAuth2MailAuth {
+class OutlookOAuth2MailAuth(val clientId: String, val verificationConsumer: Consumer<OutlookOAuth2Verification>) : OAuth2MailAuth {
     private val authority = "https://login.microsoftonline.com/consumers"
     private val scope = "https://outlook.office.com/IMAP.AccessAsUser.All"
 
@@ -17,13 +20,18 @@ class OutlookOAuth2MailAuth(val clientId: String) : OAuth2MailAuth {
                 .builder(clientId)
                 .authority(authority)
                 .build()
-            val params = InteractiveRequestParameters
-                .builder(URI("http://localhost:8080/"))
-                .scopes(setOf(scope))
+            val deviceParams = DeviceCodeFlowParameters
+                .builder(setOf(scope)) {
+                    verificationConsumer.accept(OutlookOAuth2Verification(
+                        verificationUri = it.verificationUri(),
+                        code = it.userCode()
+                    ))
+                }
                 .build()
             val future = CompletableFuture<OAuth2MailUser>()
-            val tokenFuture = app.acquireToken(params)
+            val tokenFuture = app.acquireToken(deviceParams)
             tokenFuture.exceptionally {
+                it.printStackTrace()
                 future.complete(
                     OAuth2MailUser(
                         error = it
@@ -53,3 +61,8 @@ class OutlookOAuth2MailAuth(val clientId: String) : OAuth2MailAuth {
         }
     }
 }
+
+data class OutlookOAuth2Verification(
+    val verificationUri: String,
+    val code: String
+)
