@@ -1,10 +1,11 @@
 package dev.reapermaga.mailkt.outlook
 
+import dev.reapermaga.mailkt.auth.FileOAuth2TokenPersistenceStorage
 import dev.reapermaga.mailkt.auth.MailAuthMethod
 
 fun main() {
-    val clientId = "<your-client-id-here>"
-    val oauth = OutlookOAuth2MailAuth(clientId) {
+    val clientId = "<your_client_id>"
+    val oauth = OutlookOAuth2MailAuth(clientId, FileOAuth2TokenPersistenceStorage("<your_email>@outlook.com")) {
         println("To sign in, use a web browser to open the page ${it.verificationUri} and enter the code ${it.code}")
     }
     val user = oauth.login().join()

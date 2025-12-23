@@ -1,25 +1,54 @@
 package dev.reapermaga.mailkt.outlook
 
-import com.microsoft.aad.msal4j.DeviceCodeFlowParameters
-import com.microsoft.aad.msal4j.PublicClientApplication
+import com.microsoft.aad.msal4j.*
 import dev.reapermaga.mailkt.auth.OAuth2MailAuth
 import dev.reapermaga.mailkt.auth.OAuth2MailUser
+import dev.reapermaga.mailkt.auth.OAuth2TokenPersistenceStorage
 import java.util.concurrent.CompletableFuture
 import java.util.function.Consumer
 
-class OutlookOAuth2MailAuth(val clientId: String, val verificationConsumer: Consumer<OutlookOAuth2Verification>) :
+class OutlookOAuth2MailAuth(
+    val clientId: String,
+    val tokenPersistenceStorage: OAuth2TokenPersistenceStorage? = null,
+    val verificationConsumer: Consumer<OutlookOAuth2Verification>
+) :
     OAuth2MailAuth {
     private val authority = "https://login.microsoftonline.com/consumers"
-    private val scope = "https://outlook.office.com/IMAP.AccessAsUser.All"
+    private val scopes = setOf("https://outlook.office.com/IMAP.AccessAsUser.All")
 
-    override fun login(): CompletableFuture<OAuth2MailUser> {
+    override fun login(): CompletableFuture<OAuth2MailUser> = CompletableFuture.supplyAsync {
         try {
             val app = PublicClientApplication
                 .builder(clientId)
                 .authority(authority)
+                .setTokenCacheAccessAspect(object : ITokenCacheAccessAspect {
+                    override fun beforeCacheAccess(ctx: ITokenCacheAccessContext) {
+                        val token = tokenPersistenceStorage?.load() ?: return
+                        ctx.tokenCache().deserialize(token)
+                    }
+
+                    override fun afterCacheAccess(ctx: ITokenCacheAccessContext) {
+                        if (ctx.hasCacheChanged() && tokenPersistenceStorage != null) {
+                            val token = ctx.tokenCache().serialize()
+                            tokenPersistenceStorage.store(token)
+                        }
+                    }
+
+
+                })
                 .build()
+            val accounts = app.accounts.join()
+            if (accounts.isNotEmpty()) {
+                val account = accounts.first()
+                val silentParams = SilentParameters.builder(scopes, account).build()
+                val token = app.acquireTokenSilently(silentParams).join()
+                return@supplyAsync OAuth2MailUser(
+                    username = token.account().username(),
+                    accessToken = token.accessToken(),
+                )
+            }
             val deviceParams = DeviceCodeFlowParameters
-                .builder(setOf(scope)) {
+                .builder(scopes) {
                     verificationConsumer.accept(
                         OutlookOAuth2Verification(
                             verificationUri = it.verificationUri(),
@@ -28,28 +57,14 @@ class OutlookOAuth2MailAuth(val clientId: String, val verificationConsumer: Cons
                     )
                 }
                 .build()
-            val future = CompletableFuture<OAuth2MailUser>()
-            val tokenFuture = app.acquireToken(deviceParams)
-            tokenFuture.exceptionally {
-                future.complete(OAuth2MailUser(error = it))
-                null
-            }
-            tokenFuture.thenAccept { result ->
-                val username = result.account().username()
-                val token = result.accessToken()
-                future.complete(
-                    OAuth2MailUser(
-                        username = username,
-                        accessToken = token
-                    )
-                )
-            }
-            return future
+            val token = app.acquireToken(deviceParams).join()
+            OAuth2MailUser(
+                username = token.account().username(),
+                accessToken = token.accessToken(),
+            )
         } catch (ex: Exception) {
-            return CompletableFuture.completedFuture(
-                OAuth2MailUser(
-                    error = ex
-                )
+            OAuth2MailUser(
+                error = ex
             )
         }
 
