@@ -4,7 +4,6 @@ plugins {
 }
 
 dependencies {
-    implementation(libs.bundles.kotlinxEcosystem)
-    implementation(libs.jakartaMail)
-    implementation(libs.msal4j)
+    api(libs.bundles.kotlinxEcosystem)
+    api(libs.jakartaMail)
 }

@@ -3,5 +3,6 @@ plugins {
 }
 
 dependencies {
+    implementation(libs.msal4j)
     implementation(project(":core"))
 }
