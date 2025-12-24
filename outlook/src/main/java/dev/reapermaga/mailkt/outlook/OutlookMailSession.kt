@@ -52,4 +52,11 @@ class OutlookMailSession : MailSession {
         }
         return currentJob!!.asCompletableFuture()
     }
+
+    override fun disconnect() {
+        currentJob?.cancel()
+        store?.close()
+        store = null
+        session = null
+    }
 }

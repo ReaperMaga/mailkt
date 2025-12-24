@@ -11,6 +11,7 @@ fun main() {
     val oauth = OutlookOAuth2MailAuth(clientId, null) {
         println("To sign in, use a web browser to open the page ${it.verificationUri} and enter the code ${it.code}")
     }
+
     val user = oauth.login().join()
     if (!user.success) {
         println("Failed to authenticate user: ${user.error?.message}")

@@ -1,6 +1,7 @@
 # mailkt
 
-Kotlin/JVM helpers for working with email over IMAP, with a ready-to-use **Outlook (Microsoft 365) OAuth2** implementation.
+Kotlin/JVM helpers for working with email over IMAP, with a ready-to-use **Outlook (Microsoft 365) OAuth2**
+implementation.
 
 This repo is organized as a small multi-module Gradle build:
 
@@ -66,9 +67,11 @@ println("Connected, total messages: ${folder.messageCount}")
 
 ## Notes / limitations
 
-- `OutlookMailSession` currently implements **only** `MailAuthMethod.OAUTH2` (other methods throw `NotImplementedError`).
+- `OutlookMailSession` currently implements **only** `MailAuthMethod.OAUTH2` (other methods throw
+  `NotImplementedError`).
 - The Outlook IMAP host is currently hardcoded to `outlook.office365.com`.
-- The OAuth authority is set to the Microsoft “consumers” tenant (`/consumers`). If you need organizational tenants, you’ll want to make this configurable.
+- The OAuth authority is set to the Microsoft “consumers” tenant (`/consumers`). If you need organizational tenants,
+  you’ll want to make this configurable.
 
 ## License
 

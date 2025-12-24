@@ -14,6 +14,8 @@ interface MailSession {
     val isConnected: Boolean
 
     fun connect(method: MailAuthMethod, username: String, password: String): CompletableFuture<MailConnection>
+
+    fun disconnect()
 }
 
 data class MailConnection(
