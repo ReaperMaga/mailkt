@@ -42,4 +42,4 @@ bin/
 .DS_Store
 
 .env
-oauth2_tokens.json
+oauth2_*.json

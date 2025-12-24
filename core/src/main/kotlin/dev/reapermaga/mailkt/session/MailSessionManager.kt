@@ -1,9 +1,8 @@
 package dev.reapermaga.mailkt.session
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.*
+import kotlinx.coroutines.future.await
+import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CopyOnWriteArrayList
@@ -14,32 +13,41 @@ class MailSessionManager(
     private val exceptionHandler: (throwable: Throwable, session: ManagedMailSession) -> Unit = { throwable, _ -> throwable.printStackTrace() }
 ) {
 
+    private val logger = LoggerFactory.getLogger(MailSessionManager::class.java)
+
     private val sessions: CopyOnWriteArrayList<ManagedMailSession> = CopyOnWriteArrayList()
 
-    private val thread = Thread({
-        while (true) {
-            val scope = CoroutineScope(Dispatchers.Default)
-            scope.launch {
-                for (managed in sessions) {
-                    try {
-                        withTimeout(reconnectTimeout) {
-                            if (!managed.session.isConnected) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    private val job = scope.launch {
+        while (isActive) {
+            val snapshot = sessions.toList()
+            logger.info("Checking ${snapshot.size} managed mail sessions for keep-alive...")
+            supervisorScope {
+                snapshot.map { managed ->
+                    async {
+                        try {
+                            withTimeout(reconnectTimeout) {
                                 managed.lastKeepAliveCheck = Instant.now()
-                                val conn = managed.connectionCallback(managed.session).join()
-                                if (!conn.success) {
-                                    error("Failed to reconnect: ${conn.error?.message}")
+                                if (!managed.session.isConnected) {
+                                    logger.info("Session is not connected, attempting to reconnect...")
+                                    val conn = managed.connectionCallback(managed.session).await()
+                                    if (!conn.success) {
+                                        error("Failed to reconnect: ${conn.error?.message}")
+                                    }
+                                } else {
+                                    logger.info("Session is connected")
                                 }
                             }
+                        } catch (ex: Exception) {
+                            exceptionHandler(ex, managed)
                         }
-                    } catch (ex: Exception) {
-                        exceptionHandler(ex, managed)
                     }
-                }
+                }.awaitAll()
             }
-
-            Thread.sleep(keepAliveInterval)
+            delay(keepAliveInterval)
         }
-    }, "MailSessionOrchestrator").apply { start() }
+    }
 
     fun manage(
         session: MailSession,
@@ -52,7 +60,7 @@ class MailSessionManager(
     }
 
     fun stop(clearSessions: Boolean = true) {
-        thread.interrupt()
+        job.cancel()
         for (managed in sessions) {
             managed.session.disconnect()
         }

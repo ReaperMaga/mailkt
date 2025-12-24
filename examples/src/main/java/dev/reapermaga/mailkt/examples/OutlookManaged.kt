@@ -40,4 +40,5 @@ fun main() {
     val folder = session.currentStore.getFolder("INBOX")
     folder.open(Folder.READ_ONLY)
     println("Connected to mailbox, total messages: ${folder.messageCount}")
+    readln()
 }

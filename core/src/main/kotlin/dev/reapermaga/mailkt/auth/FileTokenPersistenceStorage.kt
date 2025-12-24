@@ -4,9 +4,9 @@ import kotlinx.serialization.json.Json
 import java.io.File
 import java.io.FileReader
 
-class FileTokenPersistenceStorage(val username: String) : TokenPersistenceStorage {
+class FileTokenPersistenceStorage(val username: String, fileName: String = "oauth2_tokens.json") : TokenPersistenceStorage {
 
-    private val file = File("oauth2_tokens.json")
+    private val file = File(fileName)
 
     override fun store(token: String) {
         when (file.exists()) {
