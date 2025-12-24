@@ -1,6 +1,6 @@
 package dev.reapermaga.mailkt.auth
 
-interface OAuth2TokenPersistenceStorage {
+interface TokenPersistenceStorage {
 
     fun store(token: String)
 

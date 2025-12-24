@@ -3,13 +3,13 @@ package dev.reapermaga.mailkt.outlook
 import com.microsoft.aad.msal4j.*
 import dev.reapermaga.mailkt.auth.OAuth2MailAuth
 import dev.reapermaga.mailkt.auth.OAuth2MailUser
-import dev.reapermaga.mailkt.auth.OAuth2TokenPersistenceStorage
+import dev.reapermaga.mailkt.auth.TokenPersistenceStorage
 import java.util.concurrent.CompletableFuture
 import java.util.function.Consumer
 
 class OutlookOAuth2MailAuth(
     val clientId: String,
-    val tokenPersistenceStorage: OAuth2TokenPersistenceStorage? = null,
+    val tokenPersistenceStorage: TokenPersistenceStorage? = null,
     val verificationConsumer: Consumer<OutlookOAuth2Verification>
 ) :
     OAuth2MailAuth {

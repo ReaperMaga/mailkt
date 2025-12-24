@@ -4,7 +4,7 @@ import kotlinx.serialization.json.Json
 import java.io.File
 import java.io.FileReader
 
-class FileOAuth2TokenPersistenceStorage(val username: String) : OAuth2TokenPersistenceStorage {
+class FileTokenPersistenceStorage(val username: String) : TokenPersistenceStorage {
 
     private val file = File("oauth2_tokens.json")
 
