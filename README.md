@@ -17,12 +17,6 @@ implementation.
 | `:outlook` | Outlook-specific OAuth2 (MSAL) + IMAP session to `outlook.office365.com`. |
 | `:examples`| Runnable samples showcasing end-to-end sign-in and mailbox access. |
 
-This repo is organized as a small multi-module Gradle build:
-
-- `:core` — common mail abstractions and utilities (Jakarta Mail + Kotlinx)
-- `:outlook` — Outlook-specific OAuth2 auth (MSAL) + IMAP session implementation
-- `:examples` — small runnable examples (currently: Outlook IMAP connect)
-
 ## Requirements
 
 - **JDK 21** (the build uses a Java toolchain set to 21)
