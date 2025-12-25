@@ -11,11 +11,11 @@ implementation.
 
 **Project structure**
 
-| Module     | Purpose |
-| ---------- | ------- |
-| `:core`    | Common mail abstractions, auth models, token persistence helpers. |
-| `:outlook` | Outlook-specific OAuth2 (MSAL) + IMAP session to `outlook.office365.com`. |
-| `:examples`| Runnable samples showcasing end-to-end sign-in and mailbox access. |
+| Module      | Purpose                                                                   |
+|-------------|---------------------------------------------------------------------------|
+| `:core`     | Common mail abstractions, auth models, token persistence helpers.         |
+| `:outlook`  | Outlook-specific OAuth2 (MSAL) + IMAP session to `outlook.office365.com`. |
+| `:examples` | Runnable samples showcasing end-to-end sign-in and mailbox access.        |
 
 ## Requirements
 
@@ -34,6 +34,7 @@ On macOS/Linux:
 
 - Build: `./gradlew build`
 - Run all checks: `./gradlew check`
+
 ## Basic example
 
 The example lives at `examples/src/main/java/dev/reapermaga/mailkt/examples/Outlook.kt` and looks like this (trimmed):
@@ -42,7 +43,7 @@ The example lives at `examples/src/main/java/dev/reapermaga/mailkt/examples/Outl
 val oauth = OutlookOAuth2MailAuth(clientId)
 
 oauth.deviceLogin {
-  println("To sign in, open ${it.verificationUri} and enter code ${it.code}")
+    println("To sign in, open ${it.verificationUri} and enter code ${it.code}")
 }.join()
 
 val user = oauth.login().join()
@@ -58,13 +59,12 @@ val folder = session.currentStore.getFolder("INBOX")
 folder.open(jakarta.mail.Folder.READ_ONLY)
 println("Connected, total messages: ${folder.messageCount}")
 ```
+
 ## Notes / limitations
 
 - `OutlookMailSession` currently implements **only** `MailAuthMethod.OAUTH2` (other methods throw
   `NotImplementedError`).
 - The Outlook IMAP host is currently hardcoded to `outlook.office365.com`.
-- The OAuth authority is set to the Microsoft “consumers” tenant (`/consumers`). If you need organizational tenants,
-  you’ll want to make this configurable.
 
 ## Contributing
 

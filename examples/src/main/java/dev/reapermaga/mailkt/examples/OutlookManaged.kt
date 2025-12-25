@@ -3,6 +3,7 @@ package dev.reapermaga.mailkt.examples
 import dev.reapermaga.mailkt.auth.FileTokenPersistenceStorage
 import dev.reapermaga.mailkt.auth.MailAuthMethod
 import dev.reapermaga.mailkt.outlook.OutlookMailSession
+import dev.reapermaga.mailkt.outlook.OutlookOAuth2Config
 import dev.reapermaga.mailkt.outlook.OutlookOAuth2MailAuth
 import dev.reapermaga.mailkt.session.MailSessionManager
 import io.github.cdimascio.dotenv.Dotenv
@@ -21,7 +22,7 @@ fun main() {
     val manager = MailSessionManager(keepAliveInterval = 3000)
 
     val store = FileTokenPersistenceStorage(testUser)
-    val oauth = OutlookOAuth2MailAuth(clientId, store)
+    val oauth = OutlookOAuth2MailAuth(OutlookOAuth2Config.consumer(clientId), store)
     if (!oauth.hasToken().join()) {
         oauth.deviceLogin {
             println("To sign in, use a web browser to open the page ${it.verificationUri} and enter the code ${it.code}")

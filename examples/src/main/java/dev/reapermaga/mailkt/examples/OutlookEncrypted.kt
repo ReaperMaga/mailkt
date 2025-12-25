@@ -4,6 +4,7 @@ import dev.reapermaga.mailkt.auth.AESEncryptedTokenPersistenceStorage
 import dev.reapermaga.mailkt.auth.FileTokenPersistenceStorage
 import dev.reapermaga.mailkt.auth.MailAuthMethod
 import dev.reapermaga.mailkt.outlook.OutlookMailSession
+import dev.reapermaga.mailkt.outlook.OutlookOAuth2Config
 import dev.reapermaga.mailkt.outlook.OutlookOAuth2MailAuth
 import dev.reapermaga.mailkt.util.generateAESKey
 import io.github.cdimascio.dotenv.Dotenv
@@ -23,7 +24,7 @@ fun main() {
         aesKey,
         FileTokenPersistenceStorage(testUser, "oauth2_encrypted.json")
     )
-    val oauth = OutlookOAuth2MailAuth(clientId, storage)
+    val oauth = OutlookOAuth2MailAuth(OutlookOAuth2Config.consumer(clientId), storage)
     if (!oauth.hasToken().join()) {
         oauth.deviceLogin {
             println("To sign in, use a web browser to open the page ${it.verificationUri} and enter the code ${it.code}")
