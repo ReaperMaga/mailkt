@@ -40,6 +40,14 @@ class OutlookOAuth2MailAuth(
         }.getOrDefault(false)
     }
 
+    fun deviceLogin(): CompletableFuture<OutlookOAuth2Verification> {
+        val future = CompletableFuture<OutlookOAuth2Verification>()
+        deviceLogin { verification ->
+            future.complete(verification)
+        }
+        return future
+    }
+
     fun deviceLogin(verificationConsumer: Consumer<OutlookOAuth2Verification>): CompletableFuture<OAuth2MailResult> =
         CompletableFuture.supplyAsync {
             try {
