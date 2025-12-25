@@ -31,12 +31,19 @@ class MailSessionManager(
                                 managed.lastKeepAliveCheck = Instant.now()
                                 if (!managed.session.isConnected) {
                                     logger.info("Session is not connected, attempting to reconnect...")
-                                    val conn = managed.connectionCallback(managed.session).await()
+                                    val conn = managed.connectionProvider(managed.session).await()
+                                    managed.lastConnection = conn
+                                    managed.lifecycle.connection.forEach {
+                                        it.onEvent(conn)
+                                    }
                                     if (!conn.success) {
                                         error("Failed to reconnect: ${conn.error?.message}")
                                     }
                                 } else {
                                     logger.info("Session is connected")
+                                }
+                                managed.lifecycle.keepAlive.forEach {
+                                    it.onEvent(Unit)
                                 }
                             }
                         } catch (ex: Exception) {
@@ -51,11 +58,12 @@ class MailSessionManager(
 
     fun manage(
         session: MailSession,
-        connectionCallback: (session: MailSession) -> CompletableFuture<MailConnection>
-    ): CompletableFuture<MailConnection> {
-        return connectionCallback(session).thenApply { conn ->
-            sessions.add(ManagedMailSession(session, Instant.now(), connectionCallback))
-            conn
+        connectionProvider: (session: MailSession) -> CompletableFuture<MailConnection>
+    ): CompletableFuture<ManagedMailSession> {
+        return connectionProvider(session).thenApply { conn ->
+            ManagedMailSession(session, Instant.now(), conn, connectionProvider).also {
+                sessions.add(it)
+            }
         }
     }
 

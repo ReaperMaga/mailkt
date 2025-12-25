@@ -24,7 +24,7 @@ fun main() {
         }.join()
     }
     val session = OutlookMailSession()
-    val conn = manager.manage(session) {
+    val managed = manager.manage(session) {
         val user = oauth.login().join()
         if (!user.success) {
             println("Failed to authenticate user: ${user.error?.message}")
@@ -36,8 +36,9 @@ fun main() {
             password = user.accessToken!!
         )
     }.join()
-    if (!conn.success) {
-        println("Failed to connect to mailbox: ${conn.error?.message}")
+
+    if (!managed.lastConnection.success) {
+        println("Failed to connect to mailbox: ${managed.lastConnection.error?.message}")
         return
     }
     val folder = session.currentStore.getFolder("INBOX")

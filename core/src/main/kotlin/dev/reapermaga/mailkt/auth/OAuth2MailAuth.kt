@@ -4,10 +4,10 @@ import java.util.concurrent.CompletableFuture
 
 interface OAuth2MailAuth {
 
-    fun login(): CompletableFuture<OAuth2MailUser>
+    fun login(): CompletableFuture<OAuth2MailResult>
 }
 
-data class OAuth2MailUser(
+data class OAuth2MailResult(
     val username: String? = null,
     val accessToken: String? = null,
     val error: Throwable? = null

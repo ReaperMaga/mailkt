@@ -6,5 +6,19 @@ import java.util.concurrent.CompletableFuture
 class ManagedMailSession(
     val session: MailSession,
     var lastKeepAliveCheck: Instant = Instant.now(),
-    val connectionCallback: (session: MailSession) -> CompletableFuture<MailConnection>
-)
+    var lastConnection: MailConnection,
+    val connectionProvider: (session: MailSession) -> CompletableFuture<MailConnection>
+) {
+
+    val lifecycle = ManagedMailSessionLifecycle()
+}
+
+class ManagedMailSessionLifecycle {
+
+    val connection = mutableListOf<LifecycleSubscriber<MailConnection>>()
+    val keepAlive = mutableListOf<LifecycleSubscriber<Unit>>()
+}
+
+fun interface LifecycleSubscriber<T : Any> {
+    fun onEvent(event: T)
+}
