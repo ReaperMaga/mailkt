@@ -32,9 +32,12 @@ On macOS/Linux:
 The example lives at `examples/src/main/java/dev/reapermaga/mailkt/examples/Outlook.kt` and looks like this (trimmed):
 
 ```kotlin
-val oauth = OutlookOAuth2MailAuth(clientId, null) {
-    println("To sign in, open ${it.verificationUri} and enter code ${it.code}")
-}
+val oauth = OutlookOAuth2MailAuth(clientId)
+
+oauth.deviceLogin {
+  println("To sign in, open ${it.verificationUri} and enter code ${it.code}")
+}.join()
+
 val user = oauth.login().join()
 
 val session = OutlookMailSession()
