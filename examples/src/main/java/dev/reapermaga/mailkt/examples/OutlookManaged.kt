@@ -16,12 +16,15 @@ fun main() {
 
     val manager = MailSessionManager(keepAliveInterval = 3000)
 
+    val store = FileTokenPersistenceStorage(testUser)
+    val oauth = OutlookOAuth2MailAuth(clientId, store)
+    if (!oauth.hasToken().join()) {
+        oauth.deviceLogin {
+            println("To sign in, use a web browser to open the page ${it.verificationUri} and enter the code ${it.code}")
+        }.join()
+    }
     val session = OutlookMailSession()
     val conn = manager.manage(session) {
-        val store = FileTokenPersistenceStorage(testUser)
-        val oauth = OutlookOAuth2MailAuth(clientId, store) {
-            println("To sign in, use a web browser to open the page ${it.verificationUri} and enter the code ${it.code}")
-        }
         val user = oauth.login().join()
         if (!user.success) {
             println("Failed to authenticate user: ${user.error?.message}")

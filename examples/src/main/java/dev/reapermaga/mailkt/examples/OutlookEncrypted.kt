@@ -19,8 +19,11 @@ fun main() {
         aesKey,
         FileTokenPersistenceStorage(testUser, "oauth2_encrypted.json")
     )
-    val oauth = OutlookOAuth2MailAuth(clientId, storage) {
-        println("To sign in, use a web browser to open the page ${it.verificationUri} and enter the code ${it.code}")
+    val oauth = OutlookOAuth2MailAuth(clientId, storage)
+    if (!oauth.hasToken().join()) {
+        oauth.deviceLogin {
+            println("To sign in, use a web browser to open the page ${it.verificationUri} and enter the code ${it.code}")
+        }.join()
     }
     val user = oauth.login().join()
     if (!user.success) {
