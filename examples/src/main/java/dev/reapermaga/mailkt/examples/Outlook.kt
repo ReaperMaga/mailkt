@@ -6,6 +6,10 @@ import dev.reapermaga.mailkt.outlook.OutlookMailSession
 import dev.reapermaga.mailkt.outlook.OutlookOAuth2MailAuth
 import io.github.cdimascio.dotenv.Dotenv
 
+/**
+ * Demonstrates authenticating against Outlook with OAuth2 using a plain JSON token store
+ * and printing the total messages in the INBOX folder.
+ */
 fun main() {
     val dotenv = Dotenv.load()
     val clientId = dotenv.get("OUTLOOK_CLIENT_ID")

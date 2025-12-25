@@ -9,6 +9,10 @@ import dev.reapermaga.mailkt.util.generateAESKey
 import io.github.cdimascio.dotenv.Dotenv
 import jakarta.mail.Folder
 
+/**
+ * Demonstrates Outlook OAuth2 login while encrypting the cached token with AES before persisting,
+ * then connects to IMAP and reports the INBOX message count.
+ */
 fun main() {
     val dotenv = Dotenv.load()
     val clientId = dotenv.get("OUTLOOK_CLIENT_ID")

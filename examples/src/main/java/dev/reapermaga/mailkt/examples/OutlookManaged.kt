@@ -9,6 +9,10 @@ import io.github.cdimascio.dotenv.Dotenv
 import jakarta.mail.Folder
 import java.util.concurrent.CompletableFuture
 
+/**
+ * Demonstrates using MailSessionManager to keep an Outlook session alive with OAuth2 credentials
+ * and listen for mailbox activity through a managed connection.
+ */
 fun main() {
     val dotenv = Dotenv.load()
     val clientId = dotenv.get("OUTLOOK_CLIENT_ID")

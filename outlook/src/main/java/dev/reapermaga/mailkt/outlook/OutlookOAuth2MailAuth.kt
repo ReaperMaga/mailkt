@@ -7,6 +7,10 @@ import dev.reapermaga.mailkt.auth.TokenPersistenceStorage
 import java.util.concurrent.CompletableFuture
 import java.util.function.Consumer
 
+/**
+ * Provides OAuth2 device-code authentication against Outlook consumer accounts using MSAL,
+ * optionally persisting the token cache via [TokenPersistenceStorage].
+ */
 class OutlookOAuth2MailAuth(
     clientId: String,
     val tokenPersistenceStorage: TokenPersistenceStorage? = null
@@ -15,6 +19,9 @@ class OutlookOAuth2MailAuth(
     private val authority = "https://login.microsoftonline.com/consumers"
     private val scopes = setOf("https://outlook.office.com/IMAP.AccessAsUser.All")
 
+    /**
+     * MSAL public client configured for the consumer authority, wired to optionally persist its cache.
+     */
     val app: PublicClientApplication = PublicClientApplication
         .builder(clientId)
         .authority(authority)
@@ -33,6 +40,9 @@ class OutlookOAuth2MailAuth(
         })
         .build()
 
+    /**
+     * Returns true when MSAL already holds at least one cached account.
+     */
     fun hasToken(): CompletableFuture<Boolean> = CompletableFuture.supplyAsync {
         runCatching {
             val accounts = app.accounts.join()
@@ -40,6 +50,9 @@ class OutlookOAuth2MailAuth(
         }.getOrDefault(false)
     }
 
+    /**
+     * Starts the device-code flow and completes with the verification details.
+     */
     fun deviceLogin(): CompletableFuture<OutlookOAuth2Verification> {
         val future = CompletableFuture<OutlookOAuth2Verification>()
         deviceLogin { verification ->
@@ -48,6 +61,10 @@ class OutlookOAuth2MailAuth(
         return future
     }
 
+    /**
+     * Runs the device-code flow, streaming verification data to [verificationConsumer],
+     * and completes with the resulting [OAuth2MailResult].
+     */
     fun deviceLogin(verificationConsumer: Consumer<OutlookOAuth2Verification>): CompletableFuture<OAuth2MailResult> =
         CompletableFuture.supplyAsync {
             try {
@@ -73,6 +90,9 @@ class OutlookOAuth2MailAuth(
             }
         }
 
+    /**
+     * Attempts a silent login using the cached account and wraps the outcome in [OAuth2MailResult].
+     */
     override fun login(): CompletableFuture<OAuth2MailResult> = CompletableFuture.supplyAsync {
         try {
             val accounts = app.accounts.join()
@@ -92,6 +112,9 @@ class OutlookOAuth2MailAuth(
     }
 }
 
+/**
+ * Verification payload returned during device-code authentication.
+ */
 data class OutlookOAuth2Verification(
     val verificationUri: String,
     val code: String

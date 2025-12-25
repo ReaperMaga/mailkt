@@ -4,11 +4,18 @@ import kotlinx.serialization.json.Json
 import java.io.File
 import java.io.FileReader
 
+/**
+ * Simple JSON-file token store intended for local experimentation rather than production use.
+ * Persists tokens per user inside a shared `oauth2_tokens.json`.
+ */
 class FileTokenPersistenceStorage(val username: String, fileName: String = "oauth2_tokens.json") :
     TokenPersistenceStorage {
 
     private val file = File(fileName)
 
+    /**
+     * Reads the current JSON map, updates the entry for [username], and rewrites the file in plain text.
+     */
     override fun store(token: String) {
         when (file.exists()) {
             true -> FileReader(file).use {
@@ -28,6 +35,9 @@ class FileTokenPersistenceStorage(val username: String, fileName: String = "oaut
         }
     }
 
+    /**
+     * Loads the JSON map from disk and returns the token for [username], or null if absent.
+     */
     override fun load(): String? {
         if (!file.exists()) return null
         FileReader(file).use {
