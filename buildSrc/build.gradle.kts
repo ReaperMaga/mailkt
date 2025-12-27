@@ -5,6 +5,11 @@ plugins {
     `kotlin-dsl`
 }
 
+repositories {
+    mavenCentral()
+    gradlePluginPortal()
+}
+
 kotlin {
     jvmToolchain(21)
 }
@@ -12,4 +17,5 @@ kotlin {
 dependencies {
     // Add a dependency on the Kotlin Gradle plugin, so that convention plugins can apply it.
     implementation(libs.kotlinGradlePlugin)
+    implementation("org.jetbrains.dokka:dokka-gradle-plugin:2.1.0")
 }
