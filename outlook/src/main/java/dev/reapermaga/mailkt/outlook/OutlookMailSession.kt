@@ -11,13 +11,14 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.future.asCompletableFuture
+import java.util.*
 import java.util.concurrent.CompletableFuture
 
 /**
  * MailSession implementation that opens IMAP connections against Outlook/Office 365 using OAuth2 credentials.
  * Manages the underlying Jakarta Mail session and store lifecycle on a background coroutine.
  */
-class OutlookMailSession : MailSession {
+class OutlookMailSession(override val id: String = UUID.randomUUID().toString()) : MailSession {
 
     override val currentSession: Session get() = session ?: error("No session")
     override val currentStore: IMAPStore get() = store ?: error("No store")

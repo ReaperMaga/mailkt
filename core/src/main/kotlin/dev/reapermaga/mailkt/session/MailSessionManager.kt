@@ -16,12 +16,16 @@ import java.util.concurrent.CopyOnWriteArrayList
  *
  * @param keepAliveInterval interval between keep-alive checks in milliseconds (default 30_000 ms).
  * @param reconnectTimeout timeout for per-session reconnection/check operations in milliseconds (default 5_000 ms).
+ * @param reconnectAttempts maximum number of reconnection attempts before giving up on a session (default 5).
+ * @param debug when true, enables debug logging of session management activities.
  * @param exceptionHandler callback invoked when an exception occurs while managing a session. Receives the throwable
  *                         and the associated ManagedMailSession.
  */
 class MailSessionManager(
     private val keepAliveInterval: Long = 30000L,
     private val reconnectTimeout: Long = 5000L,
+    private val reconnectAttempts: Int = 5,
+    private val debug: Boolean = false,
     private val exceptionHandler: (throwable: Throwable, session: ManagedMailSession) -> Unit = { throwable, _ -> throwable.printStackTrace() }
 ) {
 
@@ -45,8 +49,8 @@ class MailSessionManager(
      */
     private val job = scope.launch {
         while (isActive) {
-            val snapshot = sessions.toList()
-            logger.info("Checking ${snapshot.size} managed mail sessions for keep-alive...")
+            val snapshot = sessions.filter { it.currentReconnectAttempt < reconnectAttempts }
+            if (debug) logger.info("Checking ${snapshot.size} managed mail sessions for keep-alive...")
             supervisorScope {
                 snapshot.map { managed ->
                     async {
@@ -54,20 +58,32 @@ class MailSessionManager(
                             withTimeout(reconnectTimeout) {
                                 managed.lastKeepAliveCheck = Instant.now()
                                 if (!managed.session.isConnected) {
-                                    logger.info("Session is not connected, attempting to reconnect...")
+                                    if (debug) logger.info("Session ${managed.session.id} is not connected, attempting to reconnect...")
+                                    managed.currentReconnectAttempt++
                                     val conn = managed.connectionProvider(managed.session).await()
                                     managed.lastConnection = conn
                                     managed.lifecycle.connection.forEach {
-                                        it.onEvent(conn)
+                                        // Using try-catch to ensure one failing subscriber doesn't affect others
+                                        try {
+                                            it.onEvent(conn)
+                                        } catch (ex: Exception) {
+                                            exceptionHandler(ex, managed)
+                                        }
                                     }
                                     if (!conn.success) {
                                         error("Failed to reconnect: ${conn.error?.message}")
                                     }
                                 } else {
-                                    logger.info("Session is connected")
+                                    if (debug) logger.info("Session ${managed.session.id} is connected.")
+                                    managed.currentReconnectAttempt = 0
                                 }
                                 managed.lifecycle.keepAlive.forEach {
-                                    it.onEvent(Unit)
+                                    // Using try-catch to ensure one failing subscriber doesn't affect others
+                                    try {
+                                        it.onEvent(Unit)
+                                    } catch (ex: Exception) {
+                                        exceptionHandler(ex, managed)
+                                    }
                                 }
                             }
                         } catch (ex: Exception) {

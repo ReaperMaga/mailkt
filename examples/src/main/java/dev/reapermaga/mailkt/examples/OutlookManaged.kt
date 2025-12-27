@@ -19,7 +19,7 @@ fun main() {
     val clientId = dotenv.get("OUTLOOK_CLIENT_ID")
     val testUser = dotenv.get("OUTLOOK_TEST_USER")
 
-    val manager = MailSessionManager(keepAliveInterval = 3000)
+    val manager = MailSessionManager(keepAliveInterval = 3000, debug = true)
 
     val store = FileTokenPersistenceStorage(testUser)
     val oauth = OutlookOAuth2MailAuth(OutlookOAuth2Config.consumer(clientId), store)

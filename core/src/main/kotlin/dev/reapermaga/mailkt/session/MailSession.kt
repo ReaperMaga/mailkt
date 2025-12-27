@@ -11,6 +11,11 @@ import java.util.concurrent.CompletableFuture
 interface MailSession {
 
     /**
+     * Unique identifier for this mail session instance. Its a user-defined value.
+     */
+    val id: String
+
+    /**
      * Jakarta Mail [Session] currently associated with this mail session instance.
      */
     val currentSession: Session

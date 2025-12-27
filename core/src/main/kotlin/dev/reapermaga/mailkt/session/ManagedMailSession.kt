@@ -9,7 +9,7 @@ class ManagedMailSession(
     var lastConnection: MailConnection,
     val connectionProvider: (session: MailSession) -> CompletableFuture<MailConnection>
 ) {
-
+    var currentReconnectAttempt: Int = 0
     val lifecycle = ManagedMailSessionLifecycle()
 }
 
