@@ -21,19 +21,28 @@ implementation.
 
 - **JDK 21** (the build uses a Java toolchain set to 21)
 
-## Build
+## Getting started
 
-Use the Gradle wrapper (recommended).
+Add the repository and dependency:
 
-On Windows:
+```kotlin
+// build.gradle.kts
+repositories {
+    mavenCentral()
+    maven {
+        name = "Averix"
+        url = uri("https://repo.averix.tech/repository/maven-releases/")
+    }
+}
 
-- Build: `./gradlew.bat build`
-- Run all checks: `./gradlew.bat check`
+// build.gradle.kts
+dependencies {
+    implementation("dev.reapermaga.mailkt:core:0.1.0")
+    implementation("dev.reapermaga.mailkt:outlook:0.1.0")
+}
+```
 
-On macOS/Linux:
-
-- Build: `./gradlew build`
-- Run all checks: `./gradlew check`
+See examples below for usage.
 
 ## Basic example
 
@@ -59,6 +68,20 @@ val folder = session.currentStore.getFolder("INBOX")
 folder.open(jakarta.mail.Folder.READ_ONLY)
 println("Connected, total messages: ${folder.messageCount}")
 ```
+
+## Build
+
+Use the Gradle wrapper (recommended).
+
+On Windows:
+
+- Build: `./gradlew.bat build`
+- Run all checks: `./gradlew.bat check`
+
+On macOS/Linux:
+
+- Build: `./gradlew build`
+- Run all checks: `./gradlew check`
 
 ## Notes / limitations
 
