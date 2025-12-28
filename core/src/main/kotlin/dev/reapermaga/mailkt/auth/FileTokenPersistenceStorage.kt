@@ -24,14 +24,14 @@ class FileTokenPersistenceStorage(val username: String, fileName: String = "oaut
                     val existingTokens =
                         Json.decodeFromString<Map<String, String>>(it.readText()).toMutableMap()
                     existingTokens[username] = token
-                    File("oauth2_tokens.json").apply {
+                    file.apply {
                         writeText(Json.encodeToString(existingTokens))
                     }
                 }
 
             false -> {
                 val newTokens = mapOf(username to token)
-                File("oauth2_tokens.json").apply { writeText(Json.encodeToString(newTokens)) }
+                file.apply { writeText(Json.encodeToString(newTokens)) }
             }
         }
     }
