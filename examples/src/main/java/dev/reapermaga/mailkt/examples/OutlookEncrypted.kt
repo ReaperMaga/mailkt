@@ -2,7 +2,7 @@ package dev.reapermaga.mailkt.examples
 
 import dev.reapermaga.mailkt.auth.AESEncryptedTokenPersistenceStorage
 import dev.reapermaga.mailkt.auth.FileTokenPersistenceStorage
-import dev.reapermaga.mailkt.auth.MailAuthMethod
+import dev.reapermaga.mailkt.session.MailAuthMethod
 import dev.reapermaga.mailkt.outlook.OutlookMailSession
 import dev.reapermaga.mailkt.outlook.OutlookOAuth2Config
 import dev.reapermaga.mailkt.outlook.OutlookOAuth2MailAuth

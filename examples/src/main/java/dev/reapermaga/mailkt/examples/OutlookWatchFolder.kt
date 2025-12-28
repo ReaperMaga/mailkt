@@ -1,7 +1,7 @@
 package dev.reapermaga.mailkt.examples
 
 import dev.reapermaga.mailkt.auth.FileTokenPersistenceStorage
-import dev.reapermaga.mailkt.auth.MailAuthMethod
+import dev.reapermaga.mailkt.session.MailAuthMethod
 import dev.reapermaga.mailkt.folder.FolderWatchHandle
 import dev.reapermaga.mailkt.folder.watchFolder
 import dev.reapermaga.mailkt.outlook.OutlookMailSession

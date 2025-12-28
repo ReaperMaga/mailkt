@@ -1,7 +1,7 @@
 package dev.reapermaga.mailkt.outlook
 
 import com.sun.mail.imap.IMAPStore
-import dev.reapermaga.mailkt.auth.MailAuthMethod
+import dev.reapermaga.mailkt.session.MailAuthMethod
 import dev.reapermaga.mailkt.session.MailConnection
 import dev.reapermaga.mailkt.session.MailSession
 import dev.reapermaga.mailkt.util.JakartaPropertiesFactory
