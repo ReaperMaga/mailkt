@@ -6,28 +6,21 @@ import jakarta.mail.Session
 import java.util.concurrent.CompletableFuture
 
 /**
- * Abstraction over a mail session capable of exposing its current state and performing connect/disconnect operations.
+ * Abstraction over a mail session capable of exposing its current state and performing
+ * connect/disconnect operations.
  */
 interface MailSession {
 
-    /**
-     * Unique identifier for this mail session instance. Its a user-defined value.
-     */
+    /** Unique identifier for this mail session instance. Its a user-defined value. */
     val id: String
 
-    /**
-     * Jakarta Mail [Session] currently associated with this mail session instance.
-     */
+    /** Jakarta Mail [Session] currently associated with this mail session instance. */
     val currentSession: Session
 
-    /**
-     * Underlying [IMAPStore] used for mailbox interactions.
-     */
+    /** Underlying [IMAPStore] used for mailbox interactions. */
     val currentStore: IMAPStore
 
-    /**
-     * Whether the underlying store is currently connected.
-     */
+    /** Whether the underlying store is currently connected. */
     val isConnected: Boolean
 
     /**
@@ -35,11 +28,13 @@ interface MailSession {
      *
      * @return a [CompletableFuture] that completes with the resulting [MailConnection]
      */
-    fun connect(method: MailAuthMethod, username: String, password: String): CompletableFuture<MailConnection>
+    fun connect(
+        method: MailAuthMethod,
+        username: String,
+        password: String,
+    ): CompletableFuture<MailConnection>
 
-    /**
-     * Disconnect the active store/session and release underlying resources.
-     */
+    /** Disconnect the active store/session and release underlying resources. */
     fun disconnect()
 }
 
@@ -49,10 +44,12 @@ interface MailSession {
 data class MailConnection(
     val session: Session? = null,
     val store: IMAPStore? = null,
-    val error: Throwable? = null
+    val error: Throwable? = null,
 ) {
     /**
-     * Convenience flag indicating whether both [session] and [store] are present and no [error] occurred.
+     * Convenience flag indicating whether both [session] and [store] are present and no [error]
+     * occurred.
      */
-    val success get() = error == null && session != null && store != null
+    val success
+        get() = error == null && session != null && store != null
 }

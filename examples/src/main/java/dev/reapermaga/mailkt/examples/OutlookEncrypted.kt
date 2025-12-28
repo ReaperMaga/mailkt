@@ -20,15 +20,20 @@ fun main() {
     val testUser = dotenv.get("OUTLOOK_TEST_USER")
     val aesKey = dotenv.get("AES_KEY") ?: generateAESKey()
     println("Using AES Key: $aesKey")
-    val storage = AESEncryptedTokenPersistenceStorage(
-        aesKey,
-        FileTokenPersistenceStorage(testUser, "oauth2_encrypted.json")
-    )
+    val storage =
+        AESEncryptedTokenPersistenceStorage(
+            aesKey,
+            FileTokenPersistenceStorage(testUser, "oauth2_encrypted.json"),
+        )
     val oauth = OutlookOAuth2MailAuth(OutlookOAuth2Config.consumer(clientId), storage)
     if (!oauth.hasToken().join()) {
-        oauth.deviceLogin {
-            println("To sign in, use a web browser to open the page ${it.verificationUri} and enter the code ${it.code}")
-        }.join()
+        oauth
+            .deviceLogin {
+                println(
+                    "To sign in, use a web browser to open the page ${it.verificationUri} and enter the code ${it.code}"
+                )
+            }
+            .join()
     }
     val user = oauth.login().join()
     if (!user.success) {
@@ -36,11 +41,14 @@ fun main() {
         return
     }
     val session = OutlookMailSession()
-    val connection = session.connect(
-        method = MailAuthMethod.OAUTH2,
-        username = user.username!!,
-        password = user.accessToken!!
-    ).join()
+    val connection =
+        session
+            .connect(
+                method = MailAuthMethod.OAUTH2,
+                username = user.username!!,
+                password = user.accessToken!!,
+            )
+            .join()
     if (!connection.success) {
         println("Failed to connect to mailbox: ${connection.error?.message}")
         return

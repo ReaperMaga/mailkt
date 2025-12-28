@@ -24,23 +24,30 @@ fun main() {
     val store = FileTokenPersistenceStorage(testUser)
     val oauth = OutlookOAuth2MailAuth(OutlookOAuth2Config.consumer(clientId), store)
     if (!oauth.hasToken().join()) {
-        oauth.deviceLogin {
-            println("To sign in, use a web browser to open the page ${it.verificationUri} and enter the code ${it.code}")
-        }.join()
+        oauth
+            .deviceLogin {
+                println(
+                    "To sign in, use a web browser to open the page ${it.verificationUri} and enter the code ${it.code}"
+                )
+            }
+            .join()
     }
     val session = OutlookMailSession()
-    val managed = manager.manage(session) {
-        val user = oauth.login().join()
-        if (!user.success) {
-            println("Failed to authenticate user: ${user.error?.message}")
-            return@manage CompletableFuture.failedFuture(user.error!!)
-        }
-        session.connect(
-            method = MailAuthMethod.OAUTH2,
-            username = user.username!!,
-            password = user.accessToken!!
-        )
-    }.join()
+    val managed =
+        manager
+            .manage(session) {
+                val user = oauth.login().join()
+                if (!user.success) {
+                    println("Failed to authenticate user: ${user.error?.message}")
+                    return@manage CompletableFuture.failedFuture(user.error!!)
+                }
+                session.connect(
+                    method = MailAuthMethod.OAUTH2,
+                    username = user.username!!,
+                    password = user.accessToken!!,
+                )
+            }
+            .join()
 
     if (!managed.lastConnection.success) {
         println("Failed to connect to mailbox: ${managed.lastConnection.error?.message}")

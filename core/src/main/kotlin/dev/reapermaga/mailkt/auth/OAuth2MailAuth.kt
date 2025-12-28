@@ -9,9 +9,7 @@ import java.util.concurrent.CompletableFuture
  */
 interface OAuth2MailAuth {
 
-    /**
-     * Initiates the login process and returns a future that will complete with the result.
-     */
+    /** Initiates the login process and returns a future that will complete with the result. */
     fun login(): CompletableFuture<OAuth2MailResult>
 }
 
@@ -25,10 +23,9 @@ interface OAuth2MailAuth {
 data class OAuth2MailResult(
     val username: String? = null,
     val accessToken: String? = null,
-    val error: Throwable? = null
+    val error: Throwable? = null,
 ) {
-    /**
-     * Indicates whether both the username and access token are present and no error occurred.
-     */
-    val success get() = error == null && username != null && accessToken != null
+    /** Indicates whether both the username and access token are present and no error occurred. */
+    val success
+        get() = error == null && username != null && accessToken != null
 }

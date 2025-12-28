@@ -7,7 +7,7 @@ class ManagedMailSession(
     val session: MailSession,
     var lastKeepAliveCheck: Instant = Instant.now(),
     var lastConnection: MailConnection,
-    val connectionProvider: (session: MailSession) -> CompletableFuture<MailConnection>
+    val connectionProvider: (session: MailSession) -> CompletableFuture<MailConnection>,
 ) {
     var currentReconnectAttempt: Int = 0
     val lifecycle = ManagedMailSessionLifecycle()
