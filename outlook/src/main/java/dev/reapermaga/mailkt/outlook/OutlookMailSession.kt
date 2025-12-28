@@ -6,13 +6,13 @@ import dev.reapermaga.mailkt.session.MailConnection
 import dev.reapermaga.mailkt.session.MailSession
 import dev.reapermaga.mailkt.util.JakartaPropertiesFactory
 import jakarta.mail.Session
-import java.util.*
-import java.util.concurrent.CompletableFuture
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.future.asCompletableFuture
+import java.util.*
+import java.util.concurrent.CompletableFuture
 
 /**
  * MailSession implementation that opens IMAP connections against Outlook/Office 365 using OAuth2

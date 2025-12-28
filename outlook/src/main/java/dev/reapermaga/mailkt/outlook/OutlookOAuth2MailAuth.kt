@@ -49,9 +49,9 @@ class OutlookOAuth2MailAuth(
     fun hasToken(): CompletableFuture<Boolean> =
         CompletableFuture.supplyAsync {
             runCatching {
-                    val accounts = app.accounts.join()
-                    accounts.isNotEmpty()
-                }
+                val accounts = app.accounts.join()
+                accounts.isNotEmpty()
+            }
                 .getOrDefault(false)
         }
 
@@ -74,13 +74,13 @@ class OutlookOAuth2MailAuth(
             try {
                 val deviceParams =
                     DeviceCodeFlowParameters.builder(config.scopes) {
-                            verificationConsumer.accept(
-                                OutlookOAuth2Verification(
-                                    verificationUri = it.verificationUri(),
-                                    code = it.userCode(),
-                                )
+                        verificationConsumer.accept(
+                            OutlookOAuth2Verification(
+                                verificationUri = it.verificationUri(),
+                                code = it.userCode(),
                             )
-                        }
+                        )
+                    }
                         .build()
                 val token = app.acquireToken(deviceParams).join()
                 OAuth2MailResult(

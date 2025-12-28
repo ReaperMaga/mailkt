@@ -1,11 +1,11 @@
 package dev.reapermaga.mailkt.session
 
-import java.time.Instant
-import java.util.concurrent.CompletableFuture
-import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.coroutines.*
 import kotlinx.coroutines.future.await
 import org.slf4j.LoggerFactory
+import java.time.Instant
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Manages MailSession instances by periodically performing keep-alive checks and attempting
@@ -55,8 +55,7 @@ class MailSessionManager(
         scope.launch {
             while (isActive) {
                 val snapshot = sessions.filter { it.currentReconnectAttempt < reconnectAttempts }
-                if (debug)
-                    logger.info("Checking ${snapshot.size} managed mail sessions for keep-alive...")
+                if (debug) logger.info("Checking ${snapshot.size} managed mail sessions for keep-alive...")
                 supervisorScope {
                     snapshot
                         .map { managed ->

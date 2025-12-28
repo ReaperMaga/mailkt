@@ -2,7 +2,6 @@
 // `buildSrc` is a Gradle-recognized directory and every plugin there will be easily available in the rest of the build.
 package buildsrc.convention
 
-import com.ncorti.ktfmt.gradle.tasks.KtfmtFormatTask
 import org.gradle.api.tasks.testing.logging.TestLogEvent
 import org.jetbrains.kotlin.gradle.plugin.extraProperties
 
@@ -10,7 +9,6 @@ plugins {
     // Apply the Kotlin JVM plugin to add support for Kotlin in JVM projects.
     kotlin("jvm")
     id("org.jetbrains.dokka")
-    id("com.ncorti.ktfmt.gradle")
     `maven-publish`
 }
 
@@ -27,15 +25,6 @@ java {
 }
 
 dokka {}
-
-ktfmt {
-    kotlinLangStyle()
-}
-
-tasks.register<KtfmtFormatTask>("ktfmtPrecommit") {
-    source = project.fileTree(rootDir)
-    include("**/*.kt")
-}
 
 tasks.register<Jar>("dokkaHtmlJar") {
     dependsOn(tasks.dokkaGenerateHtml)

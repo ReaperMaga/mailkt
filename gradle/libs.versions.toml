@@ -14,9 +14,6 @@ dotenv = "3.2.0"
 slf4j = "2.0.17"
 slf4jSimple = "2.0.17"
 
-ktfmt = "0.23.0"
-
-
 [libraries]
 kotlinGradlePlugin = { module = "org.jetbrains.kotlin:kotlin-gradle-plugin", version.ref = "kotlin" }
 kotlinxDatetime = { module = "org.jetbrains.kotlinx:kotlinx-datetime", version.ref = "kotlinxDatetime" }
@@ -31,8 +28,6 @@ dotenv = { module = "io.github.cdimascio:dotenv-java", version.ref = "dotenv" }
 
 slf4jApi = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
 slf4jSimple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4jSimple" }
-
-ktfmt = { module = "com.ncorti.ktfmt.gradle:plugin", version.ref = "ktfmt" }
 
 # Libraries can be bundled together for easier import
 [bundles]

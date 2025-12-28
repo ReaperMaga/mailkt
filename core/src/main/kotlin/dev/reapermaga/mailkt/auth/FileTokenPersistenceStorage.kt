@@ -1,8 +1,8 @@
 package dev.reapermaga.mailkt.auth
 
+import kotlinx.serialization.json.Json
 import java.io.File
 import java.io.FileReader
-import kotlinx.serialization.json.Json
 
 /**
  * Simple JSON-file token store intended for local experimentation rather than production use.
