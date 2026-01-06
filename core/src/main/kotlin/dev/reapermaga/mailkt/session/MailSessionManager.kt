@@ -38,7 +38,7 @@ class MailSessionManager(
     private val logger = LoggerFactory.getLogger(MailSessionManager::class.java)
 
     /** Thread-safe list of currently managed sessions. */
-    private val sessions: CopyOnWriteArrayList<ManagedMailSession> = CopyOnWriteArrayList()
+    val sessions: CopyOnWriteArrayList<ManagedMailSession> = CopyOnWriteArrayList()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
