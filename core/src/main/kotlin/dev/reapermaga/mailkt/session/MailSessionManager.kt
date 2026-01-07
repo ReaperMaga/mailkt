@@ -139,6 +139,20 @@ class MailSessionManager(
     }
 
     /**
+     * Stop managing a MailSession: removes it from the internal registry and optionally disconnects
+     * it.
+     *
+     * @param managed the ManagedMailSession to remove
+     * @param disconnect when true (default) disconnects the session if it is connected
+     */
+    fun remove(managed: ManagedMailSession, disconnect: Boolean = true) {
+        sessions.remove(managed)
+        if (disconnect && managed.session.isConnected) {
+            managed.session.disconnect()
+        }
+    }
+
+    /**
      * Stop the manager: cancels the background job and disconnects all managed sessions.
      *
      * @param clearSessions when true (default) the internal registry of managed sessions is cleared
