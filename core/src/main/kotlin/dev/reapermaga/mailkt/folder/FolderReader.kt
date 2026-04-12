@@ -17,7 +17,7 @@ fun readMessages(session: MailSession, folderName: String, limit: Int = 100): Li
     folder.open(Folder.READ_ONLY)
     val count = folder.messageCount
     val start = maxOf(1, count - limit + 1)
-    val messages = folder.getMessages(start, limit).toList()
+    val messages = folder.getMessages(start, count).toList()
     folder.close()
     return messages
 }
