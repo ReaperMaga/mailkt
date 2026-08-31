@@ -1,60 +1,40 @@
 package dev.reapermaga.mailkt.examples
 
 import dev.reapermaga.mailkt.auth.FileTokenPersistenceStorage
-import dev.reapermaga.mailkt.session.MailAuthMethod
 import dev.reapermaga.mailkt.outlook.OutlookMailSession
 import dev.reapermaga.mailkt.outlook.OutlookOAuth2Config
 import dev.reapermaga.mailkt.outlook.OutlookOAuth2MailAuth
+import dev.reapermaga.mailkt.session.MailCredentials
 import dev.reapermaga.mailkt.session.MailSessionManager
 import io.github.cdimascio.dotenv.Dotenv
-import jakarta.mail.Folder
-import java.util.concurrent.CompletableFuture
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runInterruptible
+import kotlin.time.Duration.Companion.seconds
 
-/**
- * Demonstrates using MailSessionManager to keep an Outlook session alive with OAuth2 credentials
- * and listen for mailbox activity through a managed connection.
- */
-fun main() {
+/** Keeps an Outlook session connected until the user presses Enter. */
+suspend fun main() {
     val dotenv = Dotenv.load()
-    val clientId = dotenv.get("OUTLOOK_CLIENT_ID")
-    val testUser = dotenv.get("OUTLOOK_TEST_USER")
-
-    val manager = MailSessionManager(keepAliveInterval = 3000, debug = true)
-
-    val store = FileTokenPersistenceStorage(testUser)
-    val oauth = OutlookOAuth2MailAuth(OutlookOAuth2Config.consumer(clientId), store)
-    if (!oauth.hasToken().join()) {
-        oauth
-            .deviceLogin {
-                println(
-                    "To sign in, use a web browser to open the page ${it.verificationUri} and enter the code ${it.code}"
-                )
-            }
-            .join()
+    val clientId = requireNotNull(dotenv.get("OUTLOOK_CLIENT_ID"))
+    val testUser = requireNotNull(dotenv.get("OUTLOOK_TEST_USER"))
+    val oauth =
+        OutlookOAuth2MailAuth(
+            OutlookOAuth2Config.consumer(clientId),
+            FileTokenPersistenceStorage(testUser),
+        )
+    if (!oauth.hasToken()) {
+        oauth.deviceLogin { println("Open ${it.verificationUri} and enter code ${it.code}") }
     }
+
+    val manager = MailSessionManager(keepAliveInterval = 3.seconds)
     val session = OutlookMailSession()
-    val managed =
-        manager
-            .manage(session) {
-                val user = oauth.login().join()
-                if (!user.success) {
-                    println("Failed to authenticate user: ${user.error?.message}")
-                    return@manage CompletableFuture.failedFuture(user.error!!)
-                }
-                session.connect(
-                    method = MailAuthMethod.OAUTH2,
-                    username = user.username!!,
-                    password = user.accessToken!!,
-                )
-            }
-            .join()
-
-    if (!managed.lastConnection.success) {
-        println("Failed to connect to mailbox: ${managed.lastConnection.error?.message}")
-        return
+    try {
+        manager.manage(session) {
+            val credentials = oauth.login()
+            it.connect(MailCredentials.oauth2(credentials.username, credentials.accessToken))
+        }
+        println("Managed Outlook session established. Press Enter to stop.")
+        runInterruptible(Dispatchers.IO) { readln() }
+    } finally {
+        manager.stop()
     }
-    val folder = session.currentStore.getFolder("INBOX")
-    folder.open(Folder.READ_ONLY)
-    println("Connected to mailbox, total messages: ${folder.messageCount}")
-    readln()
 }

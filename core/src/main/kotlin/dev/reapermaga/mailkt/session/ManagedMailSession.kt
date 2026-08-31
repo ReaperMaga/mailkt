@@ -1,24 +1,67 @@
 package dev.reapermaga.mailkt.session
 
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.time.Instant
-import java.util.concurrent.CompletableFuture
 
-class ManagedMailSession(
+class ManagedMailSession internal constructor(
     val session: MailSession,
-    var lastKeepAliveCheck: Instant = Instant.now(),
-    var lastConnection: MailConnection,
-    val connectionProvider: (session: MailSession) -> CompletableFuture<MailConnection>,
+    initialConnection: MailConnection,
+    internal val connectionProvider: suspend (MailSession) -> MailConnection,
 ) {
-    var currentReconnectAttempt: Int = 0
-    val lifecycle = ManagedMailSessionLifecycle()
+    @Volatile
+    var lastKeepAliveCheck: Instant = Instant.now()
+        internal set
+
+    @Volatile
+    var lastConnection: MailConnection = initialConnection
+        internal set
+
+    internal var currentReconnectAttempt: Int = 0
+
+    private val mutableState =
+        MutableStateFlow<ManagedMailSessionState>(
+            ManagedMailSessionState.Connected(initialConnection, reconnected = false)
+        )
+    val state: StateFlow<ManagedMailSessionState> = mutableState.asStateFlow()
+
+    private val mutableEvents =
+        MutableSharedFlow<ManagedMailSessionEvent>(
+            extraBufferCapacity = 64,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        )
+    val events: SharedFlow<ManagedMailSessionEvent> = mutableEvents.asSharedFlow()
+
+    internal fun updateState(state: ManagedMailSessionState) {
+        mutableState.value = state
+    }
+
+    internal fun emit(event: ManagedMailSessionEvent) {
+        mutableEvents.tryEmit(event)
+    }
 }
 
-class ManagedMailSessionLifecycle {
+sealed interface ManagedMailSessionState {
+    data class Connected(val connection: MailConnection, val reconnected: Boolean) :
+        ManagedMailSessionState
 
-    val connection = mutableListOf<LifecycleSubscriber<MailConnection>>()
-    val keepAlive = mutableListOf<LifecycleSubscriber<Unit>>()
+    data class Reconnecting(val attempt: Int) : ManagedMailSessionState
+
+    data class ReconnectFailed(val attempts: Int, val cause: Throwable) : ManagedMailSessionState
+
+    data class Stopped(val cause: Throwable? = null) : ManagedMailSessionState
 }
 
-fun interface LifecycleSubscriber<T : Any> {
-    fun onEvent(event: T)
+sealed interface ManagedMailSessionEvent {
+    data class Connected(val connection: MailConnection, val reconnected: Boolean) :
+        ManagedMailSessionEvent
+
+    data class KeepAlive(val checkedAt: Instant) : ManagedMailSessionEvent
+
+    data class ReconnectFailed(val attempt: Int, val cause: Throwable) : ManagedMailSessionEvent
 }

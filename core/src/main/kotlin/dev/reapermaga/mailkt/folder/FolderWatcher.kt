@@ -1,61 +1,76 @@
 package dev.reapermaga.mailkt.folder
 
-import com.sun.mail.imap.IdleManager
 import dev.reapermaga.mailkt.session.MailSession
 import jakarta.mail.Folder
 import jakarta.mail.Message
 import jakarta.mail.event.MessageCountAdapter
 import jakarta.mail.event.MessageCountEvent
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asExecutor
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.buffer
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.runInterruptible
+import org.eclipse.angus.mail.imap.IdleManager
+import java.util.concurrent.Executor
 
 /**
- * Handle returned by [watchFolder] that keeps the watched [folder] and [idleManager] alive.
- * Call [close] to stop listening for new messages and release the underlying resources.
- */
-data class FolderWatchHandle(val folder: Folder, val idleManager: IdleManager) {
-    fun close() {
-        idleManager.stop()
-        if (folder.isOpen) {
-            folder.close(false)
-        }
-    }
-}
-
-/**
- * Opens the given folder in the provided [session], registers an IMAP IDLE listener that invokes [receive]
- * for each newly added message, and returns a [FolderWatchHandle] for lifecycle management.
- *
- * @param session Active mail session containing the target store.
- * @param name Folder name to watch.
- * @param threadPool Executor used by [IdleManager]; defaults to a single-thread executor.
- * @param folderMode Mode used when opening the folder (e.g., [Folder.READ_ONLY]).
- * @param receive Callback invoked with the latest message whenever the server pushes updates.
- * @return A [FolderWatchHandle] that can be closed to stop watching.
+ * Returns a cold stream of messages added to [name]. Every collector owns one folder and IDLE
+ * manager; cancellation closes both resources.
  */
 fun watchFolder(
     session: MailSession,
     name: String,
-    threadPool: ExecutorService = Executors.newSingleThreadExecutor(),
     folderMode: Int = Folder.READ_ONLY,
-    receive: (message: Message) -> Unit,
-): FolderWatchHandle {
-    val idleManager = IdleManager(session.currentSession, threadPool)
-    val folder = session.currentStore.getFolder(name)
-    folder.open(folderMode)
-    val listener = object : MessageCountAdapter() {
-        override fun messagesAdded(event: MessageCountEvent) {
-            val source = event.source as Folder
-            val latestMessage = source.getMessage(source.messageCount)
-            try {
-                receive(latestMessage)
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-            }
-            idleManager.watch(source)
-        }
+    bufferCapacity: Int = Channel.BUFFERED,
+    ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    executor: Executor = ioDispatcher.asExecutor(),
+): Flow<Message> {
+    require(name.isNotBlank()) { "name must not be blank" }
+    require(bufferCapacity == Channel.BUFFERED || bufferCapacity > 0) {
+        "bufferCapacity must be positive or Channel.BUFFERED"
     }
-    folder.addMessageCountListener(listener)
-    idleManager.watch(folder)
-    return FolderWatchHandle(folder, idleManager)
+
+    return callbackFlow {
+            var idleManager: IdleManager? = null
+            var folder: Folder? = null
+            val listener =
+                object : MessageCountAdapter() {
+                    override fun messagesAdded(event: MessageCountEvent) {
+                        event.messages.forEach { trySend(it) }
+                        val source = event.source as? Folder ?: return
+                        runCatching { idleManager?.watch(source) }.onFailure { close(it) }
+                    }
+                }
+
+            try {
+                runInterruptible(ioDispatcher) {
+                    val connection =
+                        requireNotNull(session.currentConnection) { "Mail session is not connected" }
+                    val createdIdleManager = IdleManager(connection.session, executor)
+                    val openedFolder = connection.store.getFolder(name)
+                    idleManager = createdIdleManager
+                    folder = openedFolder
+                    openedFolder.open(folderMode)
+                    openedFolder.addMessageCountListener(listener)
+                    createdIdleManager.watch(openedFolder)
+                }
+            } catch (exception: Exception) {
+                runCatching { folder?.removeMessageCountListener(listener) }
+                runCatching { idleManager?.stop() }
+                runCatching { if (folder?.isOpen == true) folder?.close(false) }
+                throw exception
+            }
+
+            awaitClose {
+                runCatching { folder?.removeMessageCountListener(listener) }
+                runCatching { idleManager?.stop() }
+                runCatching { if (folder?.isOpen == true) folder?.close(false) }
+            }
+        }
+        .buffer(bufferCapacity, BufferOverflow.DROP_OLDEST)
 }

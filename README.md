@@ -1,32 +1,32 @@
 # mailkt
 
-Kotlin/JVM helpers for working with email over IMAP, with a ready-to-use **Outlook (Microsoft 365) OAuth2**
-implementation.
+Coroutine-first Kotlin/JVM helpers for email over IMAP, with ready-to-use Outlook (Microsoft 365)
+and Gmail OAuth2 implementations.
 
-**Highlights**
+Highlights:
 
-- Minimal IMAP abstraction layer over Jakarta Mail with Kotlin-first ergonomics.
-- Pluggable OAuth2 auth layer that separates token acquisition from session usage.
-- Ready-to-run Outlook sample demonstrating device-code sign-in + IMAP access.
+- Suspending authentication, connection, folder, and lifecycle APIs.
+- Eclipse Angus Mail with secure TLS defaults and cancellable blocking calls.
+- Structured session management through `StateFlow` and `SharedFlow`.
+- Cold `Flow` mailbox notifications with automatic IMAP IDLE cleanup.
+- Atomic token-file writes and optional AES-GCM encryption.
 
-**Project structure**
+## Modules
 
 | Module      | Purpose                                                                   |
 |-------------|---------------------------------------------------------------------------|
-| `:core`     | Common mail abstractions, auth models, token persistence helpers.         |
-| `:outlook`  | Outlook-specific OAuth2 (MSAL) + IMAP session to `outlook.office365.com`. |
-| `:examples` | Runnable samples showcasing end-to-end sign-in and mailbox access.        |
+| `:core`     | Mail abstractions, session management, folders, and token persistence.    |
+| `:outlook`  | MSAL OAuth2 and IMAP access through `outlook.office365.com`.              |
+| `:gmail`    | Google installed-app OAuth2 and IMAP access through `imap.gmail.com`.     |
+| `:examples` | Runnable coroutine-first provider and lifecycle examples.                 |
 
 ## Requirements
 
-- **JDK 21** (the build uses a Java toolchain set to 21)
+- JDK 21
 
-## Getting started
-
-Add the repository and dependency:
+## Installation
 
 ```kotlin
-// build.gradle.kts
 repositories {
     mavenCentral()
     maven {
@@ -35,43 +35,81 @@ repositories {
     }
 }
 
-// build.gradle.kts
 dependencies {
     implementation("dev.reapermaga.mailkt:core:0.1.0")
     implementation("dev.reapermaga.mailkt:outlook:0.1.0")
+    implementation("dev.reapermaga.mailkt:gmail:0.1.0")
 }
 ```
 
-See examples below for usage.
+## Outlook
 
-## Basic example
-
-The example lives at `examples/src/main/java/dev/reapermaga/mailkt/examples/Outlook.kt` and looks like this (trimmed):
+The public API uses suspending functions, so a command-line entry point can itself be `suspend`:
 
 ```kotlin
-val oauth = OutlookOAuth2MailAuth(clientId)
+suspend fun main() {
+    val oauth = OutlookOAuth2MailAuth(
+        OutlookOAuth2Config.consumer(clientId),
+        FileTokenPersistenceStorage(username),
+    )
+    val credentials = if (oauth.hasToken()) {
+        oauth.login()
+    } else {
+        oauth.deviceLogin {
+            println("Open ${it.verificationUri} and enter code ${it.code}")
+        }
+    }
 
-oauth.deviceLogin {
-    println("To sign in, open ${it.verificationUri} and enter code ${it.code}")
-}.join()
+    val session = OutlookMailSession()
+    try {
+        session.connect(
+            MailCredentials.oauth2(credentials.username, credentials.accessToken)
+        )
 
-val user = oauth.login().join()
+        val inbox = readMessages(session, "INBOX")
+        try {
+            println("Loaded ${inbox.messages.size} recent messages")
+        } finally {
+            inbox.close()
+        }
+    } finally {
+        session.disconnect()
+    }
+}
+```
 
-val session = OutlookMailSession()
-val connection = session.connect(
-    method = MailAuthMethod.OAUTH2,
-    username = user.username!!,
-    password = user.accessToken!!
-).join()
+## Gmail
 
-val folder = session.currentStore.getFolder("INBOX")
-folder.open(jakarta.mail.Folder.READ_ONLY)
-println("Connected, total messages: ${folder.messageCount}")
+Create a Google OAuth client with the Desktop app application type. First-time login opens a
+browser and receives Google's redirect through a temporary loopback server; later calls refresh the
+persisted credential.
+
+```kotlin
+val oauth = GmailOAuth2MailAuth(
+    GmailOAuth2Config.installedApp(clientId, clientSecret),
+    FileTokenPersistenceStorage("gmail"),
+)
+val credentials = oauth.login()
+
+val session = GmailMailSession()
+session.connect(MailCredentials.oauth2(credentials.username, credentials.accessToken))
+```
+
+Gmail IMAP access requires the `https://mail.google.com/` OAuth scope. Public applications using
+this scope may need to complete Google's app verification process.
+
+## Watching a folder
+
+Folder notifications are a cold `Flow`. Cancelling collection unregisters the listener and stops
+IMAP IDLE automatically.
+
+```kotlin
+watchFolder(session, "INBOX").collect { message ->
+    println("New message: ${message.subject}")
+}
 ```
 
 ## Build
-
-Use the Gradle wrapper (recommended).
 
 On Windows:
 
@@ -83,15 +121,14 @@ On macOS/Linux:
 - Build: `./gradlew build`
 - Run all checks: `./gradlew check`
 
-## Notes / limitations
+## Notes
 
-- `OutlookMailSession` currently implements **only** `MailAuthMethod.OAUTH2` (other methods throw
-  `NotImplementedError`).
-- The Outlook IMAP host is currently hardcoded to `outlook.office365.com`.
-
-## Contributing
-
-Feel free to open discussions or PRs for new providers, auth flows, or utility improvements.
+- Provider sessions support OAuth2 only; the reusable `ImapMailSession` base can also be configured
+  for plain authentication.
+- Authentication and connection failures are thrown. Use `try/catch` at application boundaries
+  instead of inspecting nullable error fields.
+- `ReadMessagesResult` keeps its folder open so Jakarta `Message` instances remain usable; always
+  call its suspending `close` function.
 
 ## License
 

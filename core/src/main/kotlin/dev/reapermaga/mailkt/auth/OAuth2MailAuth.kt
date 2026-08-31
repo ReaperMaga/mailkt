@@ -1,31 +1,24 @@
 package dev.reapermaga.mailkt.auth
 
-import java.util.concurrent.CompletableFuture
-
 /**
  * Defines the contract for fetching OAuth2 credentials used by a mail session.
- *
- * @return a future completing with the authentication result.
  */
 interface OAuth2MailAuth {
 
-    /** Initiates the login process and returns a future that will complete with the result. */
-    fun login(): CompletableFuture<OAuth2MailResult>
+    /** Returns valid credentials or throws when authentication fails. */
+    suspend fun login(): OAuth2Credentials
 }
 
-/**
- * Encapsulates the outcome of an OAuth2 mail authentication attempt.
- *
- * @property username resolved account identifier when successful.
- * @property accessToken bearer token used to authorize SMTP/IMAP connections.
- * @property error optional failure describing why credentials could not be produced.
- */
-data class OAuth2MailResult(
-    val username: String? = null,
-    val accessToken: String? = null,
-    val error: Throwable? = null,
+/** Valid OAuth2 credentials ready for an IMAP connection. */
+data class OAuth2Credentials(
+    val username: String,
+    val accessToken: String,
 ) {
-    /** Indicates whether both the username and access token are present and no error occurred. */
-    val success
-        get() = error == null && username != null && accessToken != null
+    init {
+        require(username.isNotBlank()) { "username must not be blank" }
+        require(accessToken.isNotBlank()) { "accessToken must not be blank" }
+    }
+
+    override fun toString(): String =
+        "OAuth2Credentials(username=$username, accessToken=<redacted>)"
 }
