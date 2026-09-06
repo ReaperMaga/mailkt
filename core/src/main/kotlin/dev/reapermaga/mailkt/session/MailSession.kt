@@ -1,9 +1,7 @@
 package dev.reapermaga.mailkt.session
 
-import com.sun.mail.imap.IMAPStore
-import dev.reapermaga.mailkt.session.MailAuthMethod
 import jakarta.mail.Session
-import java.util.concurrent.CompletableFuture
+import org.eclipse.angus.mail.imap.IMAPStore
 
 /**
  * Abstraction over a mail session capable of exposing its current state and performing
@@ -14,42 +12,45 @@ interface MailSession {
     /** Unique identifier for this mail session instance. Its a user-defined value. */
     val id: String
 
-    /** Jakarta Mail [Session] currently associated with this mail session instance. */
-    val currentSession: Session
-
-    /** Underlying [IMAPStore] used for mailbox interactions. */
-    val currentStore: IMAPStore
-
     /** Whether the underlying store is currently connected. */
     val isConnected: Boolean
 
+    /** Current connection snapshot, or null before connection/after disconnection. */
+    val currentConnection: MailConnection?
+
     /**
-     * Connect to the mail store using the provided authentication method and credentials.
-     *
-     * @return a [CompletableFuture] that completes with the resulting [MailConnection]
+     * Connects to the mail store and returns the live connection. Failures are thrown.
      */
-    fun connect(
-        method: MailAuthMethod,
-        username: String,
-        password: String,
-    ): CompletableFuture<MailConnection>
+    suspend fun connect(credentials: MailCredentials): MailConnection
 
     /** Disconnect the active store/session and release underlying resources. */
-    fun disconnect()
+    suspend fun disconnect()
 }
 
-/**
- * Result of a mail connection attempt, carrying the created session/store or the encountered error.
- */
+/** Immutable snapshot of a successful mail connection. */
 data class MailConnection(
-    val session: Session? = null,
-    val store: IMAPStore? = null,
-    val error: Throwable? = null,
+    val session: Session,
+    val store: IMAPStore,
+)
+
+/** Credentials used to authenticate an IMAP session. */
+data class MailCredentials(
+    val method: MailAuthMethod,
+    val username: String,
+    val secret: String,
 ) {
-    /**
-     * Convenience flag indicating whether both [session] and [store] are present and no [error]
-     * occurred.
-     */
-    val success
-        get() = error == null && session != null && store != null
+    init {
+        require(username.isNotBlank()) { "username must not be blank" }
+        require(secret.isNotBlank()) { "secret must not be blank" }
+    }
+
+    companion object {
+        fun oauth2(username: String, accessToken: String) =
+            MailCredentials(MailAuthMethod.OAUTH2, username, accessToken)
+    }
+
+    override fun toString(): String =
+        "MailCredentials(method=$method, username=$username, secret=<redacted>)"
 }
+
+class MailConnectionException(message: String, cause: Throwable) : RuntimeException(message, cause)

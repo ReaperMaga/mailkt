@@ -1,168 +1,187 @@
 package dev.reapermaga.mailkt.session
 
-import kotlinx.coroutines.*
-import kotlinx.coroutines.future.await
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import java.time.Instant
-import java.util.concurrent.CompletableFuture
-import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 
-/**
- * Manages MailSession instances by periodically performing keep-alive checks and attempting
- * reconnections.
- *
- * The manager runs a background coroutine that iterates over managed sessions at a fixed interval
- * and invokes lifecycle events. If a session is not connected, the provided connectionProvider is
- * used to attempt a reconnect. Exceptions during management are delegated to [exceptionHandler].
- *
- * @param keepAliveInterval interval between keep-alive checks in milliseconds (default 30_000 ms).
- * @param reconnectTimeout timeout for per-session reconnection/check operations in milliseconds
- *   (default 5_000 ms).
- * @param reconnectAttempts maximum number of reconnection attempts before giving up on a session
- *   (default 5).
- * @param debug when true, enables debug logging of session management activities.
- * @param exceptionHandler callback invoked when an exception occurs while managing a session.
- *   Receives the throwable and the associated ManagedMailSession.
- */
+/** Maintains and reconnects mail sessions in a lifecycle bound to [parentScope]. */
 class MailSessionManager(
-    private val keepAliveInterval: Long = 30000L,
-    private val reconnectTimeout: Long = 5000L,
-    private val reconnectAttempts: Int = 5,
-    private val debug: Boolean = false,
-    private val exceptionHandler: (throwable: Throwable, session: ManagedMailSession) -> Unit =
-        { throwable, _ ->
-            throwable.printStackTrace()
-        },
+    private val keepAliveInterval: Duration = 30.seconds,
+    private val reconnectTimeout: Duration = 30.seconds,
+    private val maxReconnectAttempts: Int = 5,
+    parentScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    private val exceptionHandler: (Throwable, ManagedMailSession) -> Unit = { _, _ -> },
 ) {
+    init {
+        require(keepAliveInterval.isPositive()) { "keepAliveInterval must be positive" }
+        require(reconnectTimeout.isPositive()) { "reconnectTimeout must be positive" }
+        require(maxReconnectAttempts > 0) { "maxReconnectAttempts must be positive" }
+    }
 
     private val logger = LoggerFactory.getLogger(MailSessionManager::class.java)
+    private val managerJob = SupervisorJob(parentScope.coroutineContext[Job])
+    private val scope = CoroutineScope(parentScope.coroutineContext + managerJob)
+    private val sessionsMutex = Mutex()
+    private val mutableSessions = MutableStateFlow<List<ManagedMailSession>>(emptyList())
+    private var stopped = false
 
-    /** Thread-safe list of currently managed sessions. */
-    val sessions: CopyOnWriteArrayList<ManagedMailSession> = CopyOnWriteArrayList()
+    /** Immutable snapshots of sessions currently owned by this manager. */
+    val sessions: StateFlow<List<ManagedMailSession>> = mutableSessions.asStateFlow()
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-
-    /**
-     * Background job that periodically:
-     * - checks each managed session's connection status,
-     * - attempts reconnection via the session's connectionProvider if disconnected,
-     * - updates timestamps and emits lifecycle events (connection and keepAlive).
-     *
-     * The per-session work is performed with a per-session [reconnectTimeout] and exceptions are
-     * handled using [exceptionHandler].
-     */
-    private val job =
+    private val monitorJob =
         scope.launch {
             while (isActive) {
-                val snapshot = sessions.filter { it.currentReconnectAttempt < reconnectAttempts }
-                if (debug) logger.info("Checking ${snapshot.size} managed mail sessions for keep-alive...")
+                val snapshot = sessions.value
                 supervisorScope {
-                    snapshot
-                        .map { managed ->
-                            async {
-                                try {
-                                    withTimeout(reconnectTimeout) {
-                                        managed.lastKeepAliveCheck = Instant.now()
-                                        if (!managed.session.isConnected) {
-                                            if (debug)
-                                                logger.info(
-                                                    "Session ${managed.session.id} is not connected, attempting to reconnect..."
-                                                )
-                                            managed.currentReconnectAttempt++
-                                            val conn =
-                                                managed.connectionProvider(managed.session).await()
-                                            managed.lastConnection = conn
-                                            managed.lifecycle.connection.forEach {
-                                                // Using try-catch to ensure one failing subscriber
-                                                // doesn't affect
-                                                // others
-                                                try {
-                                                    it.onEvent(conn)
-                                                } catch (ex: Exception) {
-                                                    exceptionHandler(ex, managed)
-                                                }
-                                            }
-                                            if (!conn.success) {
-                                                error("Failed to reconnect: ${conn.error?.message}")
-                                            }
-                                        } else {
-                                            if (debug)
-                                                logger.info(
-                                                    "Session ${managed.session.id} is connected."
-                                                )
-                                            managed.currentReconnectAttempt = 0
-                                        }
-                                        managed.lifecycle.keepAlive.forEach {
-                                            // Using try-catch to ensure one failing subscriber
-                                            // doesn't affect others
-                                            try {
-                                                it.onEvent(Unit)
-                                            } catch (ex: Exception) {
-                                                exceptionHandler(ex, managed)
-                                            }
-                                        }
-                                    }
-                                } catch (ex: Exception) {
-                                    exceptionHandler(ex, managed)
-                                }
-                            }
-                        }
-                        .awaitAll()
+                    snapshot.map { managed -> async { checkSession(managed) } }.forEach { it.await() }
                 }
                 delay(keepAliveInterval)
             }
         }
 
-    /**
-     * Begin managing a MailSession by obtaining an initial connection and registering a
-     * ManagedMailSession.
-     *
-     * The returned CompletableFuture completes when the initial connection is acquired. The created
-     * ManagedMailSession is added to the internal registry and will be monitored by the manager's
-     * background job.
-     *
-     * @param session the MailSession to manage
-     * @param connectionProvider a function that returns a CompletableFuture of MailConnection for
-     *   the given session
-     * @return CompletableFuture that completes with the created ManagedMailSession after obtaining
-     *   the initial connection
-     */
-    fun manage(
+    /** Establishes an initial connection and starts managing [session]. */
+    suspend fun manage(
         session: MailSession,
-        connectionProvider: (session: MailSession) -> CompletableFuture<MailConnection>,
-    ): CompletableFuture<ManagedMailSession> {
-        return connectionProvider(session).thenApply { conn ->
-            ManagedMailSession(session, Instant.now(), conn, connectionProvider).also {
-                sessions.add(it)
+        connectionProvider: suspend (MailSession) -> MailConnection,
+    ): ManagedMailSession {
+        sessionsMutex.withLock { check(!stopped) { "MailSessionManager is stopped" } }
+        val connection = withTimeout(reconnectTimeout) { connectionProvider(session) }
+        val managed = ManagedMailSession(session, connection, connectionProvider)
+        val accepted =
+            sessionsMutex.withLock {
+                if (stopped) return@withLock false
+                require(mutableSessions.value.none { it.session.id == session.id }) {
+                    "A session with id ${session.id} is already managed"
+                }
+                mutableSessions.value = mutableSessions.value + managed
+                true
+            }
+        if (!accepted) {
+            session.disconnect()
+            error("MailSessionManager was stopped while connecting session ${session.id}")
+        }
+        managed.emit(ManagedMailSessionEvent.Connected(connection, reconnected = false))
+        return managed
+    }
+
+    /** Stops managing one session and optionally disconnects it. */
+    suspend fun remove(managed: ManagedMailSession, disconnect: Boolean = true) {
+        val removed =
+            sessionsMutex.withLock {
+                val previous = mutableSessions.value
+                mutableSessions.value = previous - managed
+                previous.size != mutableSessions.value.size
+            }
+        if (!removed) return
+        managed.updateState(ManagedMailSessionState.Stopped())
+        if (disconnect) managed.session.disconnect()
+    }
+
+    /** Cancels monitoring, disconnects all sessions, and optionally clears the registry. */
+    suspend fun stop(clearSessions: Boolean = true) =
+        withContext(NonCancellable) {
+            val snapshot =
+                sessionsMutex.withLock {
+                    stopped = true
+                    sessions.value.also {
+                        if (clearSessions) mutableSessions.value = emptyList()
+                    }
+                }
+            managerJob.cancel()
+            monitorJob.cancelAndJoin()
+            supervisorScope {
+                snapshot
+                    .map { managed ->
+                        async {
+                            try {
+                                managed.session.disconnect()
+                            } catch (exception: Exception) {
+                                reportFailure(exception, managed)
+                            }
+                            managed.updateState(ManagedMailSessionState.Stopped())
+                        }
+                    }
+                    .forEach { it.await() }
+            }
+        }
+
+    private suspend fun checkSession(managed: ManagedMailSession) {
+        if (managed !in sessions.value) return
+        try {
+            withTimeout(reconnectTimeout) {
+                val checkedAt = Instant.now()
+                managed.lastKeepAliveCheck = checkedAt
+                val connected = runInterruptible(Dispatchers.IO) { managed.session.isConnected }
+                if (connected) {
+                    managed.currentReconnectAttempt = 0
+                    managed.emit(ManagedMailSessionEvent.KeepAlive(checkedAt))
+                    return@withTimeout
+                }
+
+                val attempt = ++managed.currentReconnectAttempt
+                managed.updateState(ManagedMailSessionState.Reconnecting(attempt))
+                val connection = managed.connectionProvider(managed.session)
+                managed.lastConnection = connection
+                managed.currentReconnectAttempt = 0
+                managed.updateState(
+                    ManagedMailSessionState.Connected(connection, reconnected = true)
+                )
+                managed.emit(ManagedMailSessionEvent.Connected(connection, reconnected = true))
+            }
+        } catch (exception: CancellationException) {
+            throw exception
+        } catch (exception: Exception) {
+            val attempts =
+                if (managed.currentReconnectAttempt == 0) {
+                    ++managed.currentReconnectAttempt
+                } else {
+                    managed.currentReconnectAttempt
+                }
+            managed.updateState(ManagedMailSessionState.ReconnectFailed(attempts, exception))
+            managed.emit(ManagedMailSessionEvent.ReconnectFailed(attempts, exception))
+            reportFailure(exception, managed)
+            if (attempts >= maxReconnectAttempts) {
+                logger.warn(
+                    "Removing mail session {} after {} failed reconnect attempts",
+                    managed.session.id,
+                    attempts,
+                )
+                try {
+                    remove(managed)
+                    managed.updateState(ManagedMailSessionState.Stopped(exception))
+                } catch (removalFailure: CancellationException) {
+                    throw removalFailure
+                } catch (removalFailure: Exception) {
+                    reportFailure(removalFailure, managed)
+                }
             }
         }
     }
 
-    /**
-     * Stop managing a MailSession: removes it from the internal registry and optionally disconnects
-     * it.
-     *
-     * @param managed the ManagedMailSession to remove
-     * @param disconnect when true (default) disconnects the session if it is connected
-     */
-    fun remove(managed: ManagedMailSession, disconnect: Boolean = true) {
-        sessions.remove(managed)
-        if (disconnect && managed.session.isConnected) {
-            managed.session.disconnect()
-        }
-    }
-
-    /**
-     * Stop the manager: cancels the background job and disconnects all managed sessions.
-     *
-     * @param clearSessions when true (default) the internal registry of managed sessions is cleared
-     *   after disconnecting.
-     */
-    fun stop(clearSessions: Boolean = true) {
-        job.cancel()
-        for (managed in sessions) {
-            managed.session.disconnect()
-        }
-        if (clearSessions) sessions.clear()
+    private fun reportFailure(throwable: Throwable, managed: ManagedMailSession) {
+        logger.warn("Mail session {} lifecycle failure", managed.session.id, throwable)
+        runCatching { exceptionHandler(throwable, managed) }
+            .onFailure { logger.error("Mail session exception handler failed", it) }
     }
 }

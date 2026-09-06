@@ -20,4 +20,5 @@ rootProject.name = "mailkt"
 
 include(":core")
 include(":outlook")
+include(":gmail")
 include(":examples")

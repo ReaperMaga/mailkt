@@ -1,16 +1,16 @@
-package dev.reapermaga.mailkt.outlook
+package dev.reapermaga.mailkt.gmail
 
 import dev.reapermaga.mailkt.session.ImapMailSession
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import java.util.UUID
 
-/** Coroutine-aware OAuth2 IMAP session for Outlook and Microsoft 365. */
-class OutlookMailSession(
+/** Coroutine-aware OAuth2 IMAP session for Gmail. */
+class GmailMailSession(
     id: String = UUID.randomUUID().toString(),
     ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : ImapMailSession(host = HOST, ioDispatcher = ioDispatcher, id = id) {
     companion object {
-        const val HOST = "outlook.office365.com"
+        const val HOST = "imap.gmail.com"
     }
 }

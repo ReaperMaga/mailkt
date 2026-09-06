@@ -5,6 +5,12 @@ data class OutlookOAuth2Config(
     val authority: String,
     val scopes: Set<String>,
 ) {
+    init {
+        require(clientId.isNotBlank()) { "clientId must not be blank" }
+        require(authority.startsWith("https://")) { "authority must use HTTPS" }
+        require(scopes.isNotEmpty()) { "scopes must not be empty" }
+    }
+
     companion object {
         fun consumer(clientId: String) =
             OutlookOAuth2Config(
