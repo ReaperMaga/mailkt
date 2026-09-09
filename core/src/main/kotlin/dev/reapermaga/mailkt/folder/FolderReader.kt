@@ -8,14 +8,17 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 
-/** Reads up to [limit] recent messages and leaves the folder open until the result is closed. */
+/**
+ * Reads messages at the one-based positions in [range], counting from the latest message, and
+ * leaves the folder open until the result is closed.
+ */
 suspend fun readMessages(
     session: MailSession,
     folderName: String,
-    limit: Int = 100,
+    range: IntRange = 1..100,
 ): ReadMessagesResult {
     require(folderName.isNotBlank()) { "folderName must not be blank" }
-    require(limit > 0) { "limit must be positive" }
+    require(!range.isEmpty() && range.first > 0) { "range must be non-empty and positive" }
 
     return runInterruptible(Dispatchers.IO) {
         val connection = requireNotNull(session.currentConnection) { "Mail session is not connected" }
@@ -24,8 +27,13 @@ suspend fun readMessages(
             folder.open(Folder.READ_ONLY)
             val count = folder.messageCount
             val messages =
-                if (count == 0) emptyList()
-                else folder.getMessages(maxOf(1, count - limit + 1), count).toList()
+                if (count == 0 || range.first > count) {
+                    emptyList()
+                } else {
+                    val oldestMessageNumber = maxOf(1, count - range.last + 1)
+                    val newestMessageNumber = count - range.first + 1
+                    folder.getMessages(oldestMessageNumber, newestMessageNumber).toList().asReversed()
+                }
             ReadMessagesResult(messages, folder)
         } catch (exception: Exception) {
             runCatching { if (folder.isOpen) folder.close(false) }

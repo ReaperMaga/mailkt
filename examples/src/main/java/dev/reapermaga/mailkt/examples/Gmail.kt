@@ -22,7 +22,7 @@ suspend fun main() {
 
     try {
         session.connect(MailCredentials.oauth2(credentials.username, credentials.accessToken))
-        val inbox = readMessages(session, "INBOX", limit = 1)
+        val inbox = readMessages(session, "INBOX", range = 1..1)
         try {
             println("Connected to Gmail, total messages: ${inbox.folder.messageCount}")
         } finally {
