@@ -20,6 +20,7 @@ import java.time.ZoneId
 import java.util.Collections
 import java.util.Date
 import java.util.IdentityHashMap
+import java.util.concurrent.TimeoutException
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -110,6 +111,11 @@ internal interface HistoricalTransport {
 
 private val historicalLogger = LoggerFactory.getLogger("dev.reapermaga.mailkt.folder.HistoricalReader")
 private const val MAX_FOLDER_REOPENS = 2
+internal const val SNAPSHOT_UID_BATCH_SIZE = 500
+
+// Only our own deadlines produce this failure; caller/provider cancellation stays cancellation.
+private class SnapshotTimeoutException(budget: String, timeout: Duration) :
+    TimeoutException("Range resolution exceeded $budget timeout $timeout")
 
 internal fun historicalFlow(
     session: ManagedMailSession,
@@ -120,20 +126,22 @@ internal fun historicalFlow(
 ): Flow<HistoricalMessage> {
     require(name.isNotBlank())
     return flow {
-        fun requestRecovery(generation: ManagedMailSession.Generation, reason: ManagedMailSession.RecoveryReason) {
+        fun requestRecovery(generation: ManagedMailSession.Generation, reason: ManagedMailSession.RecoveryReason): Boolean {
             val accepted = session.requestRecovery(generation, reason)
             historicalLogger.info(
                 "Historical recovery session={} generation={} reason={} outcome={}",
                 session.session.id, generation.number, reason, if (accepted) "requested" else "coalesced-or-stale",
             )
+            return accepted
         }
-        suspend fun connection(): ManagedMailSession.Generation {
+        suspend fun connection(onCandidate: (ManagedMailSession.Generation) -> Unit = {}): ManagedMailSession.Generation {
             while (true) {
                 currentCoroutineContext().ensureActive()
                 when (val state = session.state.value) {
                     is ManagedMailSessionState.Connected -> {
                         val generation = session.generation()
                         if (generation.connection === state.connection) {
+                            onCandidate(generation)
                             if (runInterruptible(Dispatchers.IO) { transport.connected(state.connection) }) {
                                 if (session.state.value == state) return generation
                             } else {
@@ -154,29 +162,33 @@ internal fun historicalFlow(
         val snapshotStarted = TimeSource.Monotonic.markNow()
         var snapshotGeneration: ManagedMailSession.Generation? = null
         val snapshot = try {
-            withTimeout(options.recoveryTimeout) {
-                val live = connection()
-                snapshotGeneration = live
-                withTimeout(options.downloadTimeout) {
+            withTimeoutOrNull(options.recoveryTimeout) {
+                // Include the selected store's liveness probe in generation-aware recovery.
+                val live = connection { snapshotGeneration = it }
+                withTimeoutOrNull(options.downloadTimeout) {
                     runInterruptible(Dispatchers.IO) { transport.snapshot(live.connection, name, range) }
-                }
-            }
-        } catch (e: TimeoutCancellationException) {
-            currentCoroutineContext().ensureActive()
-            historicalLogger.warn(
-                "Historical read operation=resolve-range uid=null attempt=1 elapsed={} generation={} outcome=failed failureType={}",
-                snapshotStarted.elapsedNow(), snapshotGeneration?.number, e.javaClass.name,
-            )
-            throw HistoricalReadException("resolve-range", null, 1, e)
+                } ?: throw SnapshotTimeoutException("download", options.downloadTimeout)
+            } ?: throw SnapshotTimeoutException("recovery", options.recoveryTimeout)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            currentCoroutineContext().ensureActive()
+            val reason = if (e is SnapshotTimeoutException) ManagedMailSession.RecoveryReason.SNAPSHOT_TIMEOUT
+                else historicalTransportRecoveryReason(e)
+            val failed = snapshotGeneration
+            val outcome = if (reason != null && failed != null) {
+                if (requestRecovery(failed, reason)) "requested" else "coalesced-or-stale"
+            } else "not-requested"
             historicalLogger.warn(
-                "Historical read operation=resolve-range uid=null attempt=1 elapsed={} generation={} outcome=failed failureType={}",
-                snapshotStarted.elapsedNow(), snapshotGeneration?.number, e.javaClass.name,
+                "Historical read operation=resolve-range uid=null attempt=1 elapsed={} generation={} outcome=failed failureType={} recoveryReason={} recoveryOutcome={}",
+                snapshotStarted.elapsedNow(), failed?.number, e.javaClass.name, reason, outcome,
             )
             throw HistoricalReadException("resolve-range", null, 1, e)
         }
+        historicalLogger.debug(
+            "Historical read operation=resolve-range uid=null attempt=1 elapsed={} generation={} outcome=resolved selectedCount={}",
+            snapshotStarted.elapsedNow(), snapshotGeneration?.number, snapshot.uids.size,
+        )
 
         for (uid in snapshot.uids) {
             var attempt = 0
@@ -257,9 +269,19 @@ internal fun historicalFlow(
 }
 
 internal fun isHistoricalTransportFailure(failure: Throwable): Boolean {
-    return historicalExceptionChain(failure).any {
-        it is FolderClosedException || it is StoreClosedException ||
-            it is java.net.SocketException || it is java.net.SocketTimeoutException
+    return historicalTransportRecoveryReason(failure) != null
+}
+
+private fun historicalTransportRecoveryReason(failure: Throwable): ManagedMailSession.RecoveryReason? {
+    val chain = historicalExceptionChain(failure)
+    return when {
+        chain.any { it is StoreClosedException } -> ManagedMailSession.RecoveryReason.STORE_CLOSED
+        chain.any { it is java.net.SocketException || it is java.net.SocketTimeoutException } ->
+            ManagedMailSession.RecoveryReason.SOCKET_FAILURE
+        // Angus may preserve a TLS failure only in this exception's message, not its cause.
+        // The folder closure itself is sufficient evidence for recovery; never parse the text.
+        chain.any { it is FolderClosedException } -> ManagedMailSession.RecoveryReason.FOLDER_CLOSED
+        else -> null
     }
 }
 
@@ -315,10 +337,23 @@ internal object ImapHistoricalTransport : HistoricalTransport {
                     ))
                 }
             }
-            val selected = messages.sortedByDescending { it.messageNumber }.map {
-                check(!it.isExpunged) { "Requested message was expunged during range resolution" }
-                uids.getUID(it).also { uid -> check(uid > 0) { "Requested message has no UID" } }
+            // Freeze membership and order before any fetch; never reselect positions after I/O.
+            val ordered = messages.sortedByDescending { it.messageNumber }
+            val profile = FetchProfile().apply { add(UIDFolder.FetchProfileItem.UID) }
+            val selected = ArrayList<Long>(ordered.size)
+            for (batch in ordered.asSequence().chunked(SNAPSHOT_UID_BATCH_SIZE)) {
+                if (Thread.currentThread().isInterrupted) throw java.io.InterruptedIOException()
+                check(uids.uidValidity == validity) { "UIDVALIDITY changed during range resolution" }
+                check(batch.none { it.isExpunged }) { "Requested message was expunged during range resolution" }
+                folder.fetch(batch.toTypedArray(), profile)
+                for (message in batch) {
+                    check(!message.isExpunged) { "Requested message was expunged during range resolution" }
+                    val uid = uids.getUID(message)
+                    check(uid > 0) { "Requested message has no UID" }
+                    selected += uid
+                }
             }
+            check(ordered.none { it.isExpunged }) { "Requested message was expunged during range resolution" }
             check(uids.uidValidity == validity) { "UIDVALIDITY changed during range resolution" }
             HistoricalSnapshot(validity, selected)
         }

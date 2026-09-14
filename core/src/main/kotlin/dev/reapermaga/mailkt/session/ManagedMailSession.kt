@@ -30,7 +30,7 @@ class ManagedMailSession internal constructor(
     // Identity, rather than Store.isConnected, determines whether a failed generation is obsolete.
     internal class Generation(val number: Long, val connection: MailConnection)
     internal enum class RecoveryReason {
-        STORE_CLOSED, SOCKET_FAILURE, DOWNLOAD_TIMEOUT, FOLDER_CLOSED, DISCONNECTED, RECONNECT_FAILED
+        STORE_CLOSED, SOCKET_FAILURE, DOWNLOAD_TIMEOUT, SNAPSHOT_TIMEOUT, FOLDER_CLOSED, DISCONNECTED, RECONNECT_FAILED
     }
     private val recoveryLock = Any()
     private var generation = Generation(1, initialConnection)

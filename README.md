@@ -162,10 +162,25 @@ readMessagesFlow(
 ```
 
 Each collection fixes range membership as an ordered UID/UIDVALIDITY snapshot before downloading
-bodies. New arrivals cannot shift it during retries. Expunged requested messages, changed
-UIDVALIDITY, and missing/nonpersistent UID support fail explicitly. If initial range resolution
+bodies. UIDs are prefetched with `UIDFolder.FetchProfileItem.UID` in batches of at most 500 selected
+messages before per-message UID access. Selection runs once, preserving newest-first order for
+both position and date ranges. New arrivals cannot shift it during retries. Expunged requested
+messages, changed UIDVALIDITY, and missing/nonpersistent UID support fail explicitly. If initial range resolution
 is interrupted, the scan fails with `operation=resolve-range`; it cannot safely reconstruct a
 position range whose original membership was never established.
+
+A recoverable folder/store/socket failure during range resolution requests replacement of the
+failed connection generation, even if the store still reports connected. Concurrent requests
+coalesce and stale generations are ignored. The current scan still fails before emitting any
+messages; neither position nor date selection is automatically retried. Subsequent operations can
+use the recovered connection. Locally owned snapshot deadlines also request recovery and appear
+as a `java.util.concurrent.TimeoutException` cause of `HistoricalReadException`. Parent cancellation
+and caller-owned deadlines propagate directly without requesting recovery.
+
+Angus 2.0.5 can convert an I/O error into a synthetic BYE response, then construct
+`FolderClosedException` with only the response text. A TLS exception can therefore be absent from
+the cause chain. Recovery uses the folder/store exception types, never message-text matching.
+This handles the closed connection; it does not establish or fix the underlying TLS failure.
 
 Downloads resume at the interrupted UID. Recoverable nested folder/store/socket errors are retried
 against a usable managed connection. Store/socket failures and download timeouts request replacement
@@ -184,7 +199,7 @@ ends the scan; it is not a durable acknowledgement protocol. Starting a new coll
 For durable processing, persist `(account, folder, uidValidity, uid)` after successful processing.
 The received timestamp is in `item.receivedAt`; MIME headers alone cannot preserve IMAP INTERNALDATE.
 
-The default flow has no prefetch or buffer and opens/closes a folder per snapshot/download attempt.
+The default flow has no body prefetch or output buffer and opens/closes a folder per snapshot/download attempt.
 It retains O(selected UIDs) metadata and one message body at a time. Serialization/parsing may need
 several copies of that body; the size cap limits serialized MIME bytes, including unknown-size
 messages, rather than total heap usage or later decoded attachments. Adding `.buffer(n)` adds up
