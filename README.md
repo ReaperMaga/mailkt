@@ -126,6 +126,70 @@ overload cannot observe store replacement and instead fails with a recoverable
 `FolderWatchException` when its folder or store closes. A UIDVALIDITY change triggers a full folder
 catch-up, deliberately preferring duplicate notifications over message loss.
 
+## Streaming historical scans
+
+Use `readMessagesFlow` with a `ManagedMailSession` for invoice scans or other historical reads.
+The existing `readMessages(MailSession, ...)` API still returns live folder-backed messages and
+requires closing its result.
+
+```kotlin
+// Before: a list of live messages; the caller owns the folder lifetime.
+val batch = readMessages(managed.session, "INBOX", 1..1000)
+try {
+    batch.messages.forEach { processMessage(it) }
+} finally {
+    batch.close()
+}
+
+// After: each body and attachment is fully downloaded before delivery.
+readMessagesFlow(managed, "INBOX", 1..1000).collect { item ->
+    processMessage(item.message)
+    // item.uid, item.uidValidity, item.receivedAt are server metadata.
+}
+
+// Inclusive server received dates; newest mailbox position first.
+readMessagesFlow(
+    managed,
+    "INBOX",
+    LocalDate.of(2026, 9, 1)..LocalDate.of(2026, 9, 14),
+    HistoricalReadOptions(
+        downloadTimeout = 30.seconds,
+        recoveryTimeout = 120.seconds,
+        maxRecoveryAttempts = 5,
+        maxMessageBytes = 25L * 1024 * 1024,
+    ),
+).collect { item -> processMessage(item.message) }
+```
+
+Each collection fixes range membership as an ordered UID/UIDVALIDITY snapshot before downloading
+bodies. New arrivals cannot shift it during retries. Expunged requested messages, changed
+UIDVALIDITY, and missing/nonpersistent UID support fail explicitly. If initial range resolution
+is interrupted, the scan fails with `operation=resolve-range`; it cannot safely reconstruct a
+position range whose original membership was never established.
+
+Downloads resume at the interrupted UID. Recoverable nested folder/store/socket errors are retried
+against a usable managed connection. A known-dead store waits for a replacement. Each message has
+its own download timeout and recovery budget (including waiting for a connection); successfully
+progressing scans have no overall deadline. `maxRecoveryAttempts` counts retries after the initial
+attempt. As with other cancellable blocking mail operations, prompt interruption depends on the
+provider; configure finite IMAP socket read/connect timeouts for transports that ignore interrupts.
+
+A successful collection delivers each selected UID once. Retrying a download never retries consumer
+code. Emissions happen outside recovery and state-switching jobs, so suspended consumers and caller
+buffers retain readable detached messages across reconnects. Cancellation or a consumer failure
+ends the scan; it is not a durable acknowledgement protocol. Starting a new collection scans anew.
+For durable processing, persist `(account, folder, uidValidity, uid)` after successful processing.
+The received timestamp is in `item.receivedAt`; MIME headers alone cannot preserve IMAP INTERNALDATE.
+
+The default flow has no prefetch or buffer and opens/closes a folder per snapshot/download attempt.
+It retains O(selected UIDs) metadata and one message body at a time. Serialization/parsing may need
+several copies of that body; the size cap limits serialized MIME bytes, including unknown-size
+messages, rather than total heap usage or later decoded attachments. Adding `.buffer(n)` adds up
+to `n` queued detached copies plus an in-flight message. No executors or listener jobs are created.
+`HistoricalReadException` exposes `operation`, `uid`, `attempt`, and the original cause; recovery
+deadline failures also preserve the last transport failure. The reader logs no message contents or
+credentials.
+
 ## Build
 
 On Windows:

@@ -1,0 +1,291 @@
+package dev.reapermaga.mailkt.folder
+
+import dev.reapermaga.mailkt.session.MailConnection
+import dev.reapermaga.mailkt.session.ManagedMailSession
+import dev.reapermaga.mailkt.session.ManagedMailSessionState
+import jakarta.mail.*
+import jakarta.mail.internet.MimeMessage
+import jakarta.mail.search.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.OutputStream
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.util.Collections
+import java.util.Date
+import java.util.IdentityHashMap
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
+
+/** A fully downloaded message. Server metadata is preserved separately from MIME headers. */
+data class HistoricalMessage(
+    val message: MimeMessage,
+    val uid: Long,
+    val uidValidity: Long,
+    val receivedAt: Instant?,
+)
+
+data class HistoricalReadOptions(
+    val downloadTimeout: Duration = 30.seconds,
+    val recoveryTimeout: Duration = 120.seconds,
+    val maxRecoveryAttempts: Int = 5,
+    val retryDelay: Duration = 250.milliseconds,
+    val maxMessageBytes: Long = 25L * 1024 * 1024,
+) {
+    init {
+        require(downloadTimeout.isPositive() && downloadTimeout.isFinite())
+        require(recoveryTimeout.isPositive() && recoveryTimeout.isFinite())
+        require(retryDelay.isPositive() && retryDelay.isFinite())
+        require(maxRecoveryAttempts >= 0)
+        require(maxMessageBytes in 1..Int.MAX_VALUE.toLong())
+    }
+}
+
+class HistoricalReadException(
+    val operation: String,
+    val uid: Long?,
+    val attempt: Int,
+    cause: Throwable,
+) : RuntimeException("Historical read failed: operation=$operation, uid=$uid, attempt=$attempt", cause)
+
+/**
+ * Cold historical scan, newest position first (1 is the newest message). Positions are resolved
+ * once to UIDs before downloading bodies. Each collector owns an independent snapshot.
+ * No prefetch or output buffer is added. See the date overload for delivery and memory guarantees.
+ */
+fun readMessagesFlow(
+    session: ManagedMailSession,
+    folderName: String,
+    range: IntRange = 1..100,
+    options: HistoricalReadOptions = HistoricalReadOptions(),
+): Flow<HistoricalMessage> {
+    require(!range.isEmpty() && range.first > 0)
+    return historicalFlow(session, folderName, HistoricalRange.Positions(range), options)
+}
+
+/**
+ * Inclusive server received-date scan, newest mailbox position first. Dates use the local time
+ * zone, matching [readMessages]. Membership is fixed before the first body download.
+ *
+ * A successful collection emits each selected UID once. Transport retries never restart downstream
+ * processing or discard queued detached values. Explicit caller buffers retain readable copies;
+ * cancellation/failure is not a durable delivery acknowledgement. A new collection starts a new
+ * scan. Expunged UIDs, changed UIDVALIDITY and missing UID support fail explicitly.
+ *
+ * Memory: O(selected UIDs) metadata plus O(maxMessageBytes) for one MIME download (serialization
+ * and parsing can require several copies). Caller buffers add one full message per slot. Bodies
+ * are never downloaded as a batch. [HistoricalReadOptions.maxMessageBytes] bounds serialized bytes,
+ * not the memory allocated by a mail provider or subsequent MIME decoding by the consumer.
+ */
+fun readMessagesFlow(
+    session: ManagedMailSession,
+    folderName: String,
+    range: ClosedRange<LocalDate>,
+    options: HistoricalReadOptions = HistoricalReadOptions(),
+): Flow<HistoricalMessage> {
+    require(!range.isEmpty())
+    return historicalFlow(session, folderName, HistoricalRange.Dates(range), options)
+}
+
+internal sealed interface HistoricalRange {
+    data class Positions(val range: IntRange) : HistoricalRange
+    data class Dates(val range: ClosedRange<LocalDate>) : HistoricalRange
+}
+
+internal data class HistoricalSnapshot(val validity: Long, val uids: List<Long>)
+
+// Transport seam keeps deterministic tests on the actual scan/recovery algorithm.
+internal interface HistoricalTransport {
+    fun snapshot(connection: MailConnection, name: String, range: HistoricalRange): HistoricalSnapshot
+    fun download(connection: MailConnection, name: String, validity: Long, uid: Long, limit: Long): HistoricalMessage
+    fun connected(connection: MailConnection): Boolean = connection.store.isConnected
+}
+
+internal fun historicalFlow(
+    session: ManagedMailSession,
+    name: String,
+    range: HistoricalRange,
+    options: HistoricalReadOptions,
+    transport: HistoricalTransport = ImapHistoricalTransport,
+): Flow<HistoricalMessage> {
+    require(name.isNotBlank())
+    return flow {
+        var deadConnection: MailConnection? = null
+        suspend fun connection(): MailConnection {
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                when (val state = session.state.value) {
+                    is ManagedMailSessionState.Connected -> {
+                        if (state.connection !== deadConnection &&
+                            runInterruptible(Dispatchers.IO) { transport.connected(state.connection) } &&
+                            session.state.value == state) return state.connection
+                    }
+                    is ManagedMailSessionState.Stopped ->
+                        throw IllegalStateException("Managed session stopped", state.cause)
+                    else -> Unit
+                }
+                delay(options.retryDelay)
+            }
+        }
+
+        // An interrupted position resolution cannot safely be repeated: the original membership
+        // is unknowable. Fail the snapshot explicitly instead of silently shifting the range.
+        val snapshot = try {
+            withTimeout(options.recoveryTimeout) {
+                val live = connection()
+                withTimeout(options.downloadTimeout) {
+                    runInterruptible(Dispatchers.IO) { transport.snapshot(live, name, range) }
+                }
+            }
+        } catch (e: TimeoutCancellationException) {
+            currentCoroutineContext().ensureActive()
+            throw HistoricalReadException("resolve-range", null, 1, e)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            throw HistoricalReadException("resolve-range", null, 1, e)
+        }
+
+        for (uid in snapshot.uids) {
+            var attempt = 0
+            var lastFailure: Exception? = null
+            val detached = try {
+                withTimeout(options.recoveryTimeout) {
+                    var result: HistoricalMessage? = null
+                    while (result == null) {
+                        val live = connection()
+                        attempt++
+                        try {
+                            result = withTimeout(options.downloadTimeout) {
+                                runInterruptible(Dispatchers.IO) {
+                                    transport.download(live, name, snapshot.validity, uid, options.maxMessageBytes)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            // The per-download timeout is retryable; parent cancellation is not.
+                            currentCoroutineContext().ensureActive()
+                            if (e is CancellationException && e !is TimeoutCancellationException) throw e
+                            lastFailure = e
+                            if (historicalExceptionChain(e).any {
+                                    it is StoreClosedException || it is java.net.SocketException ||
+                                        it is java.net.SocketTimeoutException
+                                }) deadConnection = live
+                            if ((!isHistoricalTransportFailure(e) && e !is TimeoutCancellationException) ||
+                                attempt > options.maxRecoveryAttempts) throw e
+                            delay(options.retryDelay)
+                        }
+                    }
+                    result
+                }
+            } catch (e: TimeoutCancellationException) {
+                currentCoroutineContext().ensureActive()
+                throw HistoricalReadException("download", uid, attempt, lastFailure ?: e).also {
+                    if (lastFailure != null && lastFailure !== e) it.addSuppressed(e)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                throw HistoricalReadException("download", uid, attempt, e)
+            }
+            // Never include emit in a retry or connection-state child job. It may suspend for an
+            // arbitrarily slow consumer; completion is recorded only after it returns.
+            emit(detached)
+        }
+    }
+}
+
+internal fun isHistoricalTransportFailure(failure: Throwable): Boolean {
+    return historicalExceptionChain(failure).any {
+        it is FolderClosedException || it is StoreClosedException ||
+            it is java.net.SocketException || it is java.net.SocketTimeoutException
+    }
+}
+
+private fun historicalExceptionChain(failure: Throwable): List<Throwable> {
+    val visited = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
+    fun walk(t: Throwable?) {
+        if (t == null || !visited.add(t) || t is CancellationException) return
+        walk(t.cause)
+        if (t is MessagingException) walk(t.nextException)
+    }
+    walk(failure)
+    return visited.toList()
+}
+
+internal object ImapHistoricalTransport : HistoricalTransport {
+    private fun <T> folder(connection: MailConnection, name: String, block: (Folder, UIDFolder) -> T): T {
+        val folder = connection.store.getFolder(name)
+        var failure: Throwable? = null
+        try {
+            folder.open(Folder.READ_ONLY)
+            val uids = folder as? UIDFolder ?: error("Server folder does not support stable UIDs")
+            check((folder as? org.eclipse.angus.mail.imap.IMAPFolder)?.uidNotSticky != true) {
+                "Server does not preserve UIDs between folder opens"
+            }
+            return block(folder, uids)
+        } catch (e: Throwable) {
+            failure = e
+            throw e
+        } finally {
+            try {
+                if (folder.isOpen) folder.close(false)
+            } catch (e: Exception) {
+                if (failure != null) failure.addSuppressed(e) else throw e
+            }
+        }
+    }
+
+    override fun snapshot(connection: MailConnection, name: String, range: HistoricalRange) =
+        folder(connection, name) { folder, uids ->
+            val validity = uids.uidValidity
+            check(validity > 0) { "Server returned invalid UIDVALIDITY" }
+            val messages = when (range) {
+                is HistoricalRange.Positions -> {
+                    val count = folder.messageCount
+                    if (range.range.first > count) emptyArray()
+                    else folder.getMessages(maxOf(1, count - range.range.last + 1), count - range.range.first + 1)
+                }
+                is HistoricalRange.Dates -> {
+                    fun LocalDate.date() = Date.from(atStartOfDay(ZoneId.systemDefault()).toInstant())
+                    folder.search(AndTerm(
+                        ReceivedDateTerm(ComparisonTerm.GE, range.range.start.date()),
+                        ReceivedDateTerm(ComparisonTerm.LT, range.range.endInclusive.plusDays(1).date()),
+                    ))
+                }
+            }
+            val selected = messages.sortedByDescending { it.messageNumber }.map {
+                check(!it.isExpunged) { "Requested message was expunged during range resolution" }
+                uids.getUID(it).also { uid -> check(uid > 0) { "Requested message has no UID" } }
+            }
+            check(uids.uidValidity == validity) { "UIDVALIDITY changed during range resolution" }
+            HistoricalSnapshot(validity, selected)
+        }
+
+    override fun download(connection: MailConnection, name: String, validity: Long, uid: Long, limit: Long) =
+        folder(connection, name) { _, uids ->
+            check(uids.uidValidity == validity) { "UIDVALIDITY changed; requested identities are invalid" }
+            val original = uids.getMessageByUID(uid) ?: error("Requested UID $uid was expunged")
+            check(!original.isExpunged) { "Requested UID $uid was expunged" }
+            val received = original.receivedDate?.toInstant()
+            check(original.size.toLong() <= limit) { "Message exceeds maxMessageBytes=$limit" }
+            val bytes = ByteArrayOutputStream()
+            val bounded = object : OutputStream() {
+                private var size = 0L
+                override fun write(b: Int) { checkSize(1); bytes.write(b) }
+                override fun write(b: ByteArray, off: Int, len: Int) { checkSize(len); bytes.write(b, off, len) }
+                private fun checkSize(count: Int) {
+                    if (Thread.currentThread().isInterrupted) throw java.io.InterruptedIOException()
+                    if (size + count > limit) throw IOException("Message exceeds maxMessageBytes=$limit")
+                    size += count
+                }
+            }
+            bounded.use { original.writeTo(it) }
+            val copy = bytes.toByteArray().inputStream().use { MimeMessage(connection.session, it) }
+            HistoricalMessage(copy, uid, validity, received)
+        }
+}
