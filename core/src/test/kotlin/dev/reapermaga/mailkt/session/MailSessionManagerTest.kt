@@ -1,6 +1,7 @@
 package dev.reapermaga.mailkt.session
 
 import jakarta.mail.Session
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -14,6 +15,48 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 class MailSessionManagerTest {
+    @Test
+    fun `publishes reconnecting before replacing the connection`() = runBlocking {
+        val manager =
+            MailSessionManager(
+                keepAliveInterval = 10.milliseconds,
+                reconnectTimeout = 1.seconds,
+                parentScope = this,
+            )
+        val session = FakeMailSession()
+        val providerEntered = CompletableDeferred<Unit>()
+        val allowReplacement = CompletableDeferred<Unit>()
+        try {
+            var initial = true
+            val managed =
+                manager.manage(session) {
+                    if (initial) {
+                        initial = false
+                    } else {
+                        providerEntered.complete(Unit)
+                        allowReplacement.await()
+                    }
+                    it.connect(credentials())
+                }
+            session.connected = false
+
+            providerEntered.await()
+            assertTrue(managed.state.value is ManagedMailSessionState.Reconnecting)
+            assertEquals(1, session.connectCalls)
+
+            allowReplacement.complete(Unit)
+            withTimeout(2.seconds) {
+                managed.state
+                    .filterIsInstance<ManagedMailSessionState.Connected>()
+                    .first { it.reconnected }
+            }
+            assertEquals(2, session.connectCalls)
+        } finally {
+            allowReplacement.complete(Unit)
+            manager.stop()
+        }
+    }
+
     @Test
     fun `reconnects a disconnected session and publishes state`() = runBlocking {
         val manager =

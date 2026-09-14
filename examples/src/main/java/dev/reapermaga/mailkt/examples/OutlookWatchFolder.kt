@@ -7,21 +7,16 @@ import dev.reapermaga.mailkt.outlook.OutlookOAuth2Config
 import dev.reapermaga.mailkt.outlook.OutlookOAuth2MailAuth
 import dev.reapermaga.mailkt.session.MailCredentials
 import dev.reapermaga.mailkt.session.MailSessionManager
-import dev.reapermaga.mailkt.session.ManagedMailSessionState
 import io.github.cdimascio.dotenv.Dotenv
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.flow.emptyFlow
-import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
 import kotlin.time.Duration.Companion.seconds
 
 /** Streams new Outlook messages and re-subscribes after managed reconnections. */
-@OptIn(ExperimentalCoroutinesApi::class)
 suspend fun main() = coroutineScope {
     val dotenv = Dotenv.load()
     val clientId = requireNotNull(dotenv.get("OUTLOOK_CLIENT_ID"))
@@ -45,23 +40,12 @@ suspend fun main() = coroutineScope {
             }
         val watcher =
             launch {
-                managed.state
-                    .flatMapLatest { state ->
-                        if (state is ManagedMailSessionState.Connected) {
-                            watchFolder(session, "INBOX").catch { failure ->
-                                println(
-                                    "INBOX watcher failed; reconnecting the mail session: " +
-                                        (failure.message ?: failure::class.simpleName)
-                                )
-                                try {
-                                    session.disconnect()
-                                } catch (disconnectFailure: Exception) {
-                                    failure.addSuppressed(disconnectFailure)
-                                }
-                            }
-                        } else {
-                            emptyFlow()
-                        }
+                watchFolder(managed, "INBOX")
+                    .catch { failure ->
+                        println(
+                            "INBOX watcher stopped: " +
+                                (failure.message ?: failure::class.simpleName)
+                        )
                     }
                     .collect { println("New message received: ${it.subject}") }
             }

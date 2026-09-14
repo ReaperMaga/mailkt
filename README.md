@@ -101,13 +101,30 @@ this scope may need to complete Google's app verification process.
 ## Watching a folder
 
 Folder notifications are a cold `Flow`. Cancelling collection unregisters the listener and stops
-IMAP IDLE automatically.
+IMAP IDLE automatically. Messages are eagerly detached before emission, so MIME bodies and
+attachments remain readable while downstream processing suspends or after the source folder closes.
 
 ```kotlin
 watchFolder(session, "INBOX").collect { message ->
     println("New message: ${message.subject}")
 }
 ```
+
+When the session is owned by `MailSessionManager`, pass the managed handle to follow reconnects:
+
+```kotlin
+watchFolder(managedSession, "INBOX").collect { message ->
+    processMessage(message)
+}
+```
+
+The managed overload closes each obsolete folder/IDLE generation and reopens against the latest
+connection. IMAP UID catch-up provides at-least-once delivery across reconnects and suppresses
+duplicates within one collector where possible. Consumers with persistent side effects should
+still de-duplicate by account/folder/`Message-ID`. The source-compatible `MailSession`
+overload cannot observe store replacement and instead fails with a recoverable
+`FolderWatchException` when its folder or store closes. A UIDVALIDITY change triggers a full folder
+catch-up, deliberately preferring duplicate notifications over message loss.
 
 ## Build
 
