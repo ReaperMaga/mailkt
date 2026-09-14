@@ -149,27 +149,34 @@ class HistoricalReaderTest {
         assertEquals("download", failure.operation)
         assertEquals(3, fixture.downloads.size)
         fixture.assertClosed()
-        fixture.onDownload = { _, _ -> }
+        val sizeFixture = Fixture()
         val tooLarge = assertFailsWith<HistoricalReadException> {
-            readMessagesFlow(fixture.managed, "INBOX", 1..1, options.copy(maxMessageBytes = 20)).collect()
+            readMessagesFlow(sizeFixture.managed, "INBOX", 1..1, options.copy(maxMessageBytes = 20)).collect()
         }
         assertEquals(1, tooLarge.attempt)
-        fixture.assertClosed()
+        assertEquals("download", tooLarge.operation)
+        sizeFixture.assertClosed()
     }
 
     @Test fun `per message timeouts are bounded and do not include consumer delay`() = runBlocking {
         val fixture = Fixture()
-        val quick = options.copy(downloadTimeout = 100.milliseconds, recoveryTimeout = 500.milliseconds,
-            maxRecoveryAttempts = 1)
-        fixture.onDownload = { _, _ -> CountDownLatch(1).await() }
-        val failure = assertFailsWith<HistoricalReadException> {
-            readMessagesFlow(fixture.managed, "INBOX", 1..1, quick).collect()
-        }
-        assertEquals(2, failure.attempt)
-        fixture.assertClosed()
-        fixture.onDownload = { _, _ -> }
-        readMessagesFlow(fixture.managed, "INBOX", 1..2, quick).collect { delay(600) }
-        fixture.assertClosed()
+        val manager = fixture.startManaging(this)
+        try {
+            val quick = options.copy(downloadTimeout = 100.milliseconds, recoveryTimeout = 1.seconds,
+                maxRecoveryAttempts = 1)
+            fixture.onDownload = { _, _ -> CountDownLatch(1).await() }
+            val failure = assertFailsWith<HistoricalReadException> {
+                readMessagesFlow(fixture.managed, "INBOX", 1..1, quick).collect()
+            }
+            assertEquals(2, failure.attempt)
+            fixture.assertClosed()
+            fixture.onDownload = { _, _ -> }
+            readMessagesFlow(fixture.managed, "INBOX", 1..2, quick).collect {
+                delay(1100) // Longer than both budgets, and outside either scope.
+                assertTrue(it.message.content is MimeMultipart)
+            }
+            fixture.assertClosed()
+        } finally { manager.stop() }
     }
 
     @Test fun `exception chains detect wrapped transport errors and resist cycles`() {
@@ -205,9 +212,10 @@ class HistoricalReaderTest {
         }
         assertEquals("resolve-range", failure.operation)
         assertTrue(fixture.folders.isEmpty())
-        fixture.managed.updateState(ManagedMailSessionState.Reconnecting(1))
+        val waiting = Fixture()
+        waiting.managed.updateState(ManagedMailSessionState.Reconnecting(1))
         val job = launch(start = CoroutineStart.UNDISPATCHED) {
-            readMessagesFlow(fixture.managed, "INBOX", 1..1, options).collect()
+            readMessagesFlow(waiting.managed, "INBOX", 1..1, options).collect()
         }
         job.cancelAndJoin()
         assertTrue(fixture.folders.isEmpty())
@@ -246,6 +254,133 @@ class HistoricalReaderTest {
         fixture.assertClosed()
     }
 
+    @Test fun `real manager escalates folder closures and resumes same UID with original snapshot`() = runBlocking {
+        withTimeout(5.seconds) {
+            val fixture = Fixture()
+            val failedStore = fixture.store
+            val manager = fixture.startManaging(this) {
+                fixture.rows += Row(4, Instant.parse("2026-09-04T12:00:00Z"))
+            }
+            try {
+                fixture.onDownload = { uid, folder ->
+                    if (uid == 2L && (folder as TestFolder).testStore === failedStore) {
+                        // The pool still claims to be healthy through all three failures.
+                        assertTrue(failedStore.live)
+                        throw IOException(FolderClosedException(folder))
+                    }
+                }
+                val result = readMessagesFlow(fixture.managed, "INBOX", 1..3, options).toList()
+                assertEquals(listOf(3L, 2L, 1L), result.map { it.uid })
+                assertEquals(listOf(3L, 2L, 2L, 2L, 2L, 1L), fixture.downloads.toList())
+                assertEquals(1, fixture.replacements)
+                assertEquals(3, fixture.resolvedUIDs)
+                assertIs<ManagedMailSessionState.Connected>(fixture.managed.state.value)
+                assertEquals(2, fixture.managed.generation().number)
+                result.forEach { assertNull(it.message.folder); assertTrue(it.message.content is MimeMultipart) }
+                fixture.assertClosed()
+            } finally { manager.stop() }
+        }
+    }
+
+    @Test fun `real manager replaces connected failed store and validates UIDVALIDITY on replacement`() = runBlocking {
+        withTimeout(5.seconds) {
+            for (changeValidity in listOf(false, true)) {
+                val fixture = Fixture()
+                val failedStore = fixture.store
+                val manager = fixture.startManaging(this) { if (changeValidity) fixture.validity = 99 }
+                try {
+                    fixture.onDownload = { uid, folder ->
+                        if (uid == 2L && (folder as TestFolder).testStore === failedStore) {
+                            assertTrue(failedStore.live)
+                            throw MessagingException("outer", IOException(StoreClosedException(failedStore)))
+                        }
+                    }
+                    val emitted = mutableListOf<Long>()
+                    suspend fun collect() = readMessagesFlow(fixture.managed, "INBOX", 1..3, options).collect { emitted += it.uid }
+                    if (changeValidity) {
+                        val error = assertFailsWith<HistoricalReadException> { collect() }
+                        assertEquals(2L, error.uid)
+                        assertEquals(2, error.attempt)
+                        assertTrue(error.cause!!.message!!.contains("UIDVALIDITY"))
+                        assertEquals(listOf(3L), emitted)
+                    } else {
+                        collect()
+                        assertEquals(listOf(3L, 2L, 1L), emitted)
+                        assertEquals(listOf(3L, 2L, 2L, 1L), fixture.downloads.toList())
+                    }
+                    assertEquals(1, fixture.replacements)
+                    assertEquals(3, fixture.resolvedUIDs)
+                    fixture.assertClosed()
+                } finally { manager.stop() }
+            }
+        }
+    }
+
+    @Test fun `real manager recovery exhaustion fails at interrupted UID and closes resources`() = runBlocking {
+        withTimeout(5.seconds) {
+            val fixture = Fixture()
+            val manager = fixture.startManaging(this)
+            try {
+                fixture.onDownload = { uid, folder -> if (uid == 2L) throw StoreClosedException(folder.store) }
+                val emitted = mutableListOf<Long>()
+                val error = assertFailsWith<HistoricalReadException> {
+                    readMessagesFlow(fixture.managed, "INBOX", 1..3, options.copy(maxRecoveryAttempts = 2))
+                        .collect { emitted += it.uid }
+                }
+                assertEquals(listOf(3L), emitted)
+                assertEquals(listOf(3L, 2L, 2L, 2L), fixture.downloads.toList())
+                assertEquals(2L, error.uid)
+                assertEquals(3, error.attempt)
+                assertIs<StoreClosedException>(error.cause)
+                fixture.assertClosed()
+            } finally { manager.stop() }
+            assertFalse(fixture.store.live)
+        }
+    }
+
+    @Test fun `real manager shutdown stops historical recovery wait and cancellation propagates`() = runBlocking {
+        withTimeout(5.seconds) {
+            for (cancelRead in listOf(false, true)) {
+                val fixture = Fixture()
+                val entered = CompletableDeferred<Unit>()
+                val manager = fixture.startManaging(this) { entered.complete(Unit); awaitCancellation() }
+                try {
+                    fixture.onDownload = { _, folder -> throw StoreClosedException(folder.store) }
+                    val read = async {
+                        runCatching { readMessagesFlow(fixture.managed, "INBOX", 1..1, options).collect() }
+                    }
+                    entered.await()
+                    if (cancelRead) {
+                        read.cancelAndJoin()
+                        assertTrue(read.isCancelled)
+                    } else {
+                        manager.stop()
+                        val error = assertIs<HistoricalReadException>(read.await().exceptionOrNull())
+                        assertEquals("download", error.operation)
+                        assertEquals(3L, error.uid)
+                    }
+                    fixture.assertClosed()
+                } finally { manager.stop() }
+            }
+        }
+    }
+
+    @Test fun `parent deadline is propagated without historical retries`() = runBlocking {
+        val fixture = Fixture()
+        val manager = fixture.startManaging(this)
+        try {
+            fixture.onDownload = { _, _ -> CountDownLatch(1).await() }
+            assertFailsWith<TimeoutCancellationException> {
+                withTimeout(100.milliseconds) {
+                    readMessagesFlow(fixture.managed, "INBOX", 1..1, options).collect()
+                }
+            }
+            assertEquals(listOf(3L), fixture.downloads.toList())
+            assertEquals(0, fixture.replacements)
+            fixture.assertClosed()
+        } finally { manager.stop() }
+    }
+
     private data class Row(val uid: Long, val date: Instant)
 
     private class Fixture {
@@ -255,6 +390,8 @@ class HistoricalReaderTest {
         @Volatile var validity = 7L
         var sticky = true
         var failResolution = false
+        var resolvedUIDs = 0
+        var replacements = 0
         var onDownload: (Long, Folder) -> Unit = { _, _ -> }
         val jakarta = Session.getInstance(Properties())
         var store = TestStore(this)
@@ -265,7 +402,16 @@ class HistoricalReaderTest {
             override suspend fun connect(credentials: MailCredentials) = currentConnection
             override suspend fun disconnect() { store.live = false }
         }
-        val managed = ManagedMailSession(mail, mail.currentConnection) { mail.currentConnection }
+        var managed = ManagedMailSession(mail, mail.currentConnection) { mail.currentConnection }
+        suspend fun startManaging(scope: CoroutineScope, onReconnect: suspend () -> Unit = {}): MailSessionManager {
+            val manager = MailSessionManager(10.milliseconds, 1.seconds, parentScope = scope)
+            var initial = true
+            managed = manager.manage(mail) {
+                if (initial) { initial = false; mail.currentConnection }
+                else { onReconnect(); replacements++; replace() }
+            }
+            return manager
+        }
         fun replace(): MailConnection { store.live = false; store = TestStore(this); return mail.currentConnection }
         fun assertClosed() { assertTrue(folders.isNotEmpty()); folders.forEach { assertFalse(it.opened); assertEquals(1, it.closes) } }
     }
@@ -290,6 +436,7 @@ class HistoricalReaderTest {
         override fun getMessage(number: Int): Message = Source(this, fixture.rows[number - 1], number)
         override fun getUID(message: Message): Long {
             if (fixture.failResolution) throw FolderClosedException(this)
+            fixture.resolvedUIDs++
             return (message as Source).row.uid
         }
         override fun getMessageByUID(uid: Long): Message? = fixture.rows.indexOfFirst { it.uid == uid }.let {

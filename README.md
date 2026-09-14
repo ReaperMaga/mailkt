@@ -168,7 +168,10 @@ is interrupted, the scan fails with `operation=resolve-range`; it cannot safely 
 position range whose original membership was never established.
 
 Downloads resume at the interrupted UID. Recoverable nested folder/store/socket errors are retried
-against a usable managed connection. A known-dead store waits for a replacement. Each message has
+against a usable managed connection. Store/socket failures and download timeouts request replacement
+of the failed connection generation, even when the store still reports connected. Folder closures
+allow two reopen retries on that generation before requesting replacement. Concurrent requests
+coalesce; late requests for replaced generations are ignored. Each message has
 its own download timeout and recovery budget (including waiting for a connection); successfully
 progressing scans have no overall deadline. `maxRecoveryAttempts` counts retries after the initial
 attempt. As with other cancellable blocking mail operations, prompt interruption depends on the
@@ -188,7 +191,21 @@ messages, rather than total heap usage or later decoded attachments. Adding `.bu
 to `n` queued detached copies plus an in-flight message. No executors or listener jobs are created.
 `HistoricalReadException` exposes `operation`, `uid`, `attempt`, and the original cause; recovery
 deadline failures also preserve the last transport failure. The reader logs no message contents or
-credentials.
+credentials. Diagnostics include operation, UID, attempt, elapsed time, connection generation,
+recovery reason and outcome; exception text from providers is not written to lifecycle logs.
+
+Each managed mailbox has an independent health-check loop. A locally owned health-check/reconnect
+deadline is reported as a recoverable `java.util.concurrent.TimeoutException` through
+`ReconnectFailed` and the manager's exception handler. It counts toward `maxReconnectAttempts`.
+Parent cancellation still propagates. A later successful health check restores `Connected`, and
+failed reconnects keep requesting replacement until success or exhaustion. The connection provider
+must establish and return a usable connection when called, including when the previous store still
+reports connected; the built-in Outlook/Gmail `connect` implementations already replace the store.
+
+No consumer API changes are required: continue sharing the same managed handle between
+`watchFolder(managed, "INBOX")` and `readMessagesFlow(managed, "INBOX", range)`. Recovery coordination
+is internal. Keep sender checks, PDF/AI processing, and other consumer work inside `collect`; those
+operations remain outside the reader's download/recovery budgets. Timeout defaults are unchanged.
 
 ## Build
 

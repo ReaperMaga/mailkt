@@ -8,7 +8,6 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -19,9 +18,14 @@ import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import java.time.Instant
+import java.util.concurrent.TimeoutException
+import kotlin.time.TimeSource
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
@@ -49,28 +53,17 @@ class MailSessionManager(
     /** Immutable snapshots of sessions currently owned by this manager. */
     val sessions: StateFlow<List<ManagedMailSession>> = mutableSessions.asStateFlow()
 
-    private val monitorJob =
-        scope.launch {
-            while (isActive) {
-                val snapshot = sessions.value
-                supervisorScope {
-                    snapshot.map { managed -> async { checkSession(managed) } }.forEach { it.await() }
-                }
-                delay(keepAliveInterval)
-            }
-        }
-
     /** Establishes an initial connection and starts managing [session]. */
     suspend fun manage(
         session: MailSession,
         connectionProvider: suspend (MailSession) -> MailConnection,
     ): ManagedMailSession {
-        sessionsMutex.withLock { check(!stopped) { "MailSessionManager is stopped" } }
+        sessionsMutex.withLock { check(!stopped && managerJob.isActive) { "MailSessionManager is stopped" } }
         val connection = withTimeout(reconnectTimeout) { connectionProvider(session) }
         val managed = ManagedMailSession(session, connection, connectionProvider)
         val accepted =
             sessionsMutex.withLock {
-                if (stopped) return@withLock false
+                if (stopped || !managerJob.isActive) return@withLock false
                 require(mutableSessions.value.none { it.session.id == session.id }) {
                     "A session with id ${session.id} is already managed"
                 }
@@ -82,6 +75,25 @@ class MailSessionManager(
             error("MailSessionManager was stopped while connecting session ${session.id}")
         }
         managed.emit(ManagedMailSessionEvent.Connected(connection, reconnected = false))
+        sessionsMutex.withLock {
+            if (!stopped && managed in sessions.value) {
+                managed.monitorJob = scope.launch {
+                    // Independent loops: a slow mailbox cannot delay another mailbox's next check.
+                    try {
+                        while (isActive && managed in sessions.value) {
+                            managed.wakeMonitor.tryReceive()
+                            checkSession(managed)
+                            if (managed !in sessions.value) break
+                            withTimeoutOrNull(keepAliveInterval) { managed.wakeMonitor.receive() }
+                        }
+                    } finally {
+                        if (managed.state.value !is ManagedMailSessionState.Stopped) {
+                            managed.updateState(ManagedMailSessionState.Stopped())
+                        }
+                    }
+                }
+            }
+        }
         return managed
     }
 
@@ -95,6 +107,9 @@ class MailSessionManager(
             }
         if (!removed) return
         managed.updateState(ManagedMailSessionState.Stopped())
+        managed.monitorJob?.let { job ->
+            if (job !== currentCoroutineContext()[Job]) job.cancelAndJoin()
+        }
         if (disconnect) managed.session.disconnect()
     }
 
@@ -108,8 +123,8 @@ class MailSessionManager(
                         if (clearSessions) mutableSessions.value = emptyList()
                     }
                 }
-            managerJob.cancel()
-            monitorJob.cancelAndJoin()
+            snapshot.forEach { it.updateState(ManagedMailSessionState.Stopped()) }
+            managerJob.cancelAndJoin()
             supervisorScope {
                 snapshot
                     .map { managed ->
@@ -128,45 +143,64 @@ class MailSessionManager(
 
     private suspend fun checkSession(managed: ManagedMailSession) {
         if (managed !in sessions.value) return
+        val generation = managed.generation()
+        val started = TimeSource.Monotonic.markNow()
+        val attempt = managed.currentReconnectAttempt + 1
+        var operation = "health-check"
+        var reason = managed.recoveryReason()
+        var replacement: MailConnection? = null
         try {
-            withTimeout(reconnectTimeout) {
+            // withTimeoutOrNull handles only THIS deadline, never a caller's timeout/cancellation.
+            val completed = withTimeoutOrNull(reconnectTimeout) {
                 val checkedAt = Instant.now()
                 managed.lastKeepAliveCheck = checkedAt
-                val connected = runInterruptible(Dispatchers.IO) { managed.session.isConnected }
-                if (connected) {
-                    managed.currentReconnectAttempt = 0
-                    managed.emit(ManagedMailSessionEvent.KeepAlive(checkedAt))
-                    return@withTimeout
+                if (reason == null) {
+                    val connected = runInterruptible(Dispatchers.IO) { managed.session.isConnected }
+                    if (connected && managed.markHealthy(generation)) {
+                        managed.currentReconnectAttempt = 0
+                        managed.emit(ManagedMailSessionEvent.KeepAlive(checkedAt))
+                        return@withTimeoutOrNull true
+                    }
                 }
 
-                val attempt = ++managed.currentReconnectAttempt
+                operation = "reconnect"
+                reason = managed.recoveryReason() ?: ManagedMailSession.RecoveryReason.DISCONNECTED
+                managed.currentReconnectAttempt = attempt
                 managed.updateState(ManagedMailSessionState.Reconnecting(attempt))
-                val connection = managed.connectionProvider(managed.session)
-                managed.lastConnection = connection
+                replacement = managed.connectionProvider(managed.session)
+                true
+            }
+            if (completed == null) throw TimeoutException("$operation exceeded $reconnectTimeout")
+            currentCoroutineContext().ensureActive()
+            replacement?.let { connection ->
+                // Publish only after the deadline scope successfully returns.
+                managed.updateState(ManagedMailSessionState.Connected(connection, reconnected = true))
                 managed.currentReconnectAttempt = 0
-                managed.updateState(
-                    ManagedMailSessionState.Connected(connection, reconnected = true)
-                )
                 managed.emit(ManagedMailSessionEvent.Connected(connection, reconnected = true))
+                logger.info(
+                    "Mail session {} operation={} attempt={} elapsed={} generation={} reason={} outcome=connected newGeneration={}",
+                    managed.session.id, operation, attempt, started.elapsedNow(), generation.number, reason,
+                    managed.generation().number,
+                )
             }
         } catch (exception: CancellationException) {
             throw exception
         } catch (exception: Exception) {
-            val attempts =
-                if (managed.currentReconnectAttempt == 0) {
-                    ++managed.currentReconnectAttempt
-                } else {
-                    managed.currentReconnectAttempt
-                }
-            managed.updateState(ManagedMailSessionState.ReconnectFailed(attempts, exception))
-            managed.emit(ManagedMailSessionEvent.ReconnectFailed(attempts, exception))
+            currentCoroutineContext().ensureActive()
+            managed.currentReconnectAttempt = attempt
+            // A provider may fail after modifying its store. Never advertise the old snapshot as
+            // healthy just because the session's (possibly different) store reports connected.
+            if (operation == "reconnect") {
+                managed.requestRecovery(generation, reason ?: ManagedMailSession.RecoveryReason.RECONNECT_FAILED)
+            }
+            managed.updateState(ManagedMailSessionState.ReconnectFailed(attempt, exception))
+            managed.emit(ManagedMailSessionEvent.ReconnectFailed(attempt, exception))
+            logger.warn(
+                "Mail session {} operation={} attempt={} elapsed={} generation={} reason={} outcome=failed failureType={}",
+                managed.session.id, operation, attempt, started.elapsedNow(), generation.number, reason, exception.javaClass.name,
+            )
             reportFailure(exception, managed)
-            if (attempts >= maxReconnectAttempts) {
-                logger.warn(
-                    "Removing mail session {} after {} failed reconnect attempts",
-                    managed.session.id,
-                    attempts,
-                )
+            if (attempt >= maxReconnectAttempts) {
                 try {
                     remove(managed)
                     managed.updateState(ManagedMailSessionState.Stopped(exception))
@@ -180,8 +214,8 @@ class MailSessionManager(
     }
 
     private fun reportFailure(throwable: Throwable, managed: ManagedMailSession) {
-        logger.warn("Mail session {} lifecycle failure", managed.session.id, throwable)
+        logger.warn("Mail session {} lifecycle failure type={}", managed.session.id, throwable.javaClass.name)
         runCatching { exceptionHandler(throwable, managed) }
-            .onFailure { logger.error("Mail session exception handler failed", it) }
+            .onFailure { logger.error("Mail session exception handler failed type={}", it.javaClass.name) }
     }
 }

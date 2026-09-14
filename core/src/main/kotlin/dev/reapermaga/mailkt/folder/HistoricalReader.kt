@@ -9,6 +9,8 @@ import jakarta.mail.search.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import org.slf4j.LoggerFactory
+import kotlin.time.TimeSource
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.OutputStream
@@ -106,6 +108,9 @@ internal interface HistoricalTransport {
     fun connected(connection: MailConnection): Boolean = connection.store.isConnected
 }
 
+private val historicalLogger = LoggerFactory.getLogger("dev.reapermaga.mailkt.folder.HistoricalReader")
+private const val MAX_FOLDER_REOPENS = 2
+
 internal fun historicalFlow(
     session: ManagedMailSession,
     name: String,
@@ -115,15 +120,26 @@ internal fun historicalFlow(
 ): Flow<HistoricalMessage> {
     require(name.isNotBlank())
     return flow {
-        var deadConnection: MailConnection? = null
-        suspend fun connection(): MailConnection {
+        fun requestRecovery(generation: ManagedMailSession.Generation, reason: ManagedMailSession.RecoveryReason) {
+            val accepted = session.requestRecovery(generation, reason)
+            historicalLogger.info(
+                "Historical recovery session={} generation={} reason={} outcome={}",
+                session.session.id, generation.number, reason, if (accepted) "requested" else "coalesced-or-stale",
+            )
+        }
+        suspend fun connection(): ManagedMailSession.Generation {
             while (true) {
                 currentCoroutineContext().ensureActive()
                 when (val state = session.state.value) {
                     is ManagedMailSessionState.Connected -> {
-                        if (state.connection !== deadConnection &&
-                            runInterruptible(Dispatchers.IO) { transport.connected(state.connection) } &&
-                            session.state.value == state) return state.connection
+                        val generation = session.generation()
+                        if (generation.connection === state.connection) {
+                            if (runInterruptible(Dispatchers.IO) { transport.connected(state.connection) }) {
+                                if (session.state.value == state) return generation
+                            } else {
+                                requestRecovery(generation, ManagedMailSession.RecoveryReason.DISCONNECTED)
+                            }
+                        }
                     }
                     is ManagedMailSessionState.Stopped ->
                         throw IllegalStateException("Managed session stopped", state.cause)
@@ -135,35 +151,51 @@ internal fun historicalFlow(
 
         // An interrupted position resolution cannot safely be repeated: the original membership
         // is unknowable. Fail the snapshot explicitly instead of silently shifting the range.
+        val snapshotStarted = TimeSource.Monotonic.markNow()
+        var snapshotGeneration: ManagedMailSession.Generation? = null
         val snapshot = try {
             withTimeout(options.recoveryTimeout) {
                 val live = connection()
+                snapshotGeneration = live
                 withTimeout(options.downloadTimeout) {
-                    runInterruptible(Dispatchers.IO) { transport.snapshot(live, name, range) }
+                    runInterruptible(Dispatchers.IO) { transport.snapshot(live.connection, name, range) }
                 }
             }
         } catch (e: TimeoutCancellationException) {
             currentCoroutineContext().ensureActive()
+            historicalLogger.warn(
+                "Historical read operation=resolve-range uid=null attempt=1 elapsed={} generation={} outcome=failed failureType={}",
+                snapshotStarted.elapsedNow(), snapshotGeneration?.number, e.javaClass.name,
+            )
             throw HistoricalReadException("resolve-range", null, 1, e)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            historicalLogger.warn(
+                "Historical read operation=resolve-range uid=null attempt=1 elapsed={} generation={} outcome=failed failureType={}",
+                snapshotStarted.elapsedNow(), snapshotGeneration?.number, e.javaClass.name,
+            )
             throw HistoricalReadException("resolve-range", null, 1, e)
         }
 
         for (uid in snapshot.uids) {
             var attempt = 0
             var lastFailure: Exception? = null
+            var folderFailures = 0
+            var previousGeneration: ManagedMailSession.Generation? = null
+            val started = TimeSource.Monotonic.markNow()
             val detached = try {
                 withTimeout(options.recoveryTimeout) {
                     var result: HistoricalMessage? = null
                     while (result == null) {
                         val live = connection()
+                        if (previousGeneration !== live) folderFailures = 0
+                        previousGeneration = live
                         attempt++
                         try {
                             result = withTimeout(options.downloadTimeout) {
                                 runInterruptible(Dispatchers.IO) {
-                                    transport.download(live, name, snapshot.validity, uid, options.maxMessageBytes)
+                                    transport.download(live.connection, name, snapshot.validity, uid, options.maxMessageBytes)
                                 }
                             }
                         } catch (e: Exception) {
@@ -171,12 +203,29 @@ internal fun historicalFlow(
                             currentCoroutineContext().ensureActive()
                             if (e is CancellationException && e !is TimeoutCancellationException) throw e
                             lastFailure = e
-                            if (historicalExceptionChain(e).any {
-                                    it is StoreClosedException || it is java.net.SocketException ||
-                                        it is java.net.SocketTimeoutException
-                                }) deadConnection = live
-                            if ((!isHistoricalTransportFailure(e) && e !is TimeoutCancellationException) ||
-                                attempt > options.maxRecoveryAttempts) throw e
+                            val chain = historicalExceptionChain(e)
+                            val reason = when {
+                                e is TimeoutCancellationException -> ManagedMailSession.RecoveryReason.DOWNLOAD_TIMEOUT
+                                chain.any { it is StoreClosedException } -> ManagedMailSession.RecoveryReason.STORE_CLOSED
+                                chain.any { it is java.net.SocketException || it is java.net.SocketTimeoutException } ->
+                                    ManagedMailSession.RecoveryReason.SOCKET_FAILURE
+                                chain.any { it is FolderClosedException } -> {
+                                    folderFailures++
+                                    if (folderFailures > MAX_FOLDER_REOPENS) ManagedMailSession.RecoveryReason.FOLDER_CLOSED else null
+                                }
+                                else -> null
+                            }
+                            val retryable = isHistoricalTransportFailure(e) || e is TimeoutCancellationException
+                            historicalLogger.warn(
+                                "Historical read operation=download uid={} attempt={} elapsed={} generation={} reason={} outcome={} failureType={}",
+                                uid, attempt, started.elapsedNow(), live.number, reason ?: "folder-reopen-or-terminal",
+                                if (retryable && attempt <= options.maxRecoveryAttempts) "retry" else "exhausted-or-terminal",
+                                e.javaClass.name,
+                            )
+                            // Invalidate the shared generation even on the last attempt, so other
+                            // readers/watchers can recover. This does not extend this UID's budget.
+                            if (reason != null) requestRecovery(live, reason)
+                            if (!retryable || attempt > options.maxRecoveryAttempts) throw e
                             delay(options.retryDelay)
                         }
                     }
@@ -184,6 +233,10 @@ internal fun historicalFlow(
                 }
             } catch (e: TimeoutCancellationException) {
                 currentCoroutineContext().ensureActive()
+                historicalLogger.warn(
+                    "Historical read operation=download uid={} attempt={} elapsed={} generation={} reason=recovery-deadline outcome=failed",
+                    uid, attempt, started.elapsedNow(), previousGeneration?.number,
+                )
                 throw HistoricalReadException("download", uid, attempt, lastFailure ?: e).also {
                     if (lastFailure != null && lastFailure !== e) it.addSuppressed(e)
                 }
@@ -192,6 +245,10 @@ internal fun historicalFlow(
             } catch (e: Exception) {
                 throw HistoricalReadException("download", uid, attempt, e)
             }
+            historicalLogger.debug(
+                "Historical read operation=download uid={} attempt={} elapsed={} generation={} outcome=downloaded",
+                uid, attempt, started.elapsedNow(), previousGeneration?.number,
+            )
             // Never include emit in a retry or connection-state child job. It may suspend for an
             // arbitrarily slow consumer; completion is recorded only after it returns.
             emit(detached)
