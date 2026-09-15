@@ -590,13 +590,25 @@ class HistoricalReaderTest {
     }
 
     @Test fun `snapshot identity failures and arbitrary TLS text fail without requesting recovery`() = runBlocking {
-        for (fault in listOf("validity", "expunged", "late-expunged", "zero-uid", "invalid-uid", "text-only")) {
+        for (fault in listOf(
+            "validity",
+            "validity-and-closed",
+            "expunged",
+            "late-expunged",
+            "zero-uid",
+            "invalid-uid",
+            "text-only",
+        )) {
             val fixture = Fixture()
             val manager = fixture.startManaging(this)
             try {
-                fixture.onFetch = { sources, _ ->
+                fixture.onFetch = { sources, folder ->
                     when (fault) {
                         "validity" -> fixture.validity = 99
+                        "validity-and-closed" -> {
+                            fixture.validity = 99
+                            folder.close(false)
+                        }
                         "expunged" -> sources[1].gone = true
                         "zero-uid" -> sources[1].uidOverride = 0
                         "invalid-uid" -> sources[1].uidOverride = -1
@@ -699,6 +711,78 @@ class HistoricalReaderTest {
         } finally { manager.stop() }
     }
 
+    @Test fun `closed folder IllegalStateException normalizes with cause while open folder stays terminal`() {
+        val fixture = Fixture()
+        val folder = fixture.store.getFolder("INBOX") as TestFolder
+        val failure = IllegalStateException("provider state failure")
+        folder.open(Folder.READ_ONLY)
+        assertSame(failure, normalizeClosedFolderFailure(folder, failure))
+        folder.close(false)
+        val normalized = assertIs<FolderClosedException>(normalizeClosedFolderFailure(folder, failure))
+        assertSame(folder, normalized.folder)
+        assertSame(failure, normalized.cause)
+        val unrelated = IllegalArgumentException("terminal")
+        assertSame(unrelated, normalizeClosedFolderFailure(folder, unrelated))
+    }
+
+    @Test fun `historical download retries after one closed-folder IllegalStateException race`() = runBlocking {
+        val fixture = Fixture()
+        val race = IllegalStateException("provider state failure")
+        fixture.onDownload = { uid, folder ->
+            if (uid == 3L && fixture.downloads.count { it == uid } == 1) {
+                folder.close(false)
+                throw race
+            }
+        }
+        val result = readMessagesFlow(fixture.managed, "INBOX", 1..1, options).single()
+        assertEquals(3L, result.uid)
+        assertEquals(listOf(3L, 3L), fixture.downloads.toList())
+        assertEquals(3, fixture.folders.size) // One snapshot plus two download attempts.
+        fixture.assertClosed()
+    }
+
+    @Test fun `open-folder IllegalStateException remains terminal and is not retried`() = runBlocking {
+        val fixture = Fixture()
+        val terminal = IllegalStateException("Folder not open")
+        fixture.onDownload = { _, folder ->
+            assertTrue(folder.isOpen)
+            throw terminal
+        }
+        val failure = assertFailsWith<HistoricalReadException> {
+            readMessagesFlow(fixture.managed, "INBOX", 1..1, options).collect()
+        }
+        // Coroutine stack-trace recovery can copy an exception across dispatcher boundaries.
+        assertIs<IllegalStateException>(failure.cause)
+        assertEquals(terminal.message, failure.cause?.message)
+        assertEquals(1, failure.attempt)
+        assertEquals(listOf(3L), fixture.downloads.toList())
+        assertFalse(isHistoricalTransportFailure(failure.cause!!))
+        fixture.assertClosed()
+    }
+
+    @Test fun `repeated closed-folder IllegalStateException races trigger managed recovery`() = runBlocking {
+        withTimeout(5.seconds) {
+            val fixture = Fixture()
+            val failedStore = fixture.store
+            val manager = fixture.startManaging(this)
+            try {
+                fixture.onDownload = { _, folder ->
+                    if ((folder as TestFolder).testStore === failedStore) {
+                        folder.close(false)
+                        throw IllegalStateException("provider state failure")
+                    }
+                }
+                val result = readMessagesFlow(fixture.managed, "INBOX", 1..1, options).single()
+                assertEquals(3L, result.uid)
+                assertEquals(listOf(3L, 3L, 3L, 3L), fixture.downloads.toList())
+                assertEquals(1, fixture.replacements)
+                assertEquals(2L, fixture.managed.generation().number)
+                assertIs<ManagedMailSessionState.Connected>(fixture.managed.state.value)
+                fixture.assertClosed()
+            } finally { manager.stop() }
+        }
+    }
+
     private data class Row(val uid: Long, val date: Instant)
 
     private class Fixture {
@@ -716,7 +800,10 @@ class HistoricalReaderTest {
         var dateSelections = 0
         var replacements = 0
         var onDownload: (Long, Folder) -> Unit = { _, _ -> }
-        val jakarta = Session.getInstance(Properties())
+        val jakarta = Session.getInstance(Properties().apply {
+            setProperty("mail.user", "test")
+            setProperty("mail.host", "localhost")
+        })
         var store = TestStore(this)
         private val mail = object : MailSession {
             override val id = "test"

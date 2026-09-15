@@ -4,12 +4,16 @@ import dev.reapermaga.mailkt.session.MailConnection
 import dev.reapermaga.mailkt.session.ManagedMailSessionState
 import jakarta.activation.DataHandler
 import jakarta.mail.Message
+import jakarta.mail.Folder
+import jakarta.mail.FolderClosedException
+import jakarta.mail.Flags
 import jakarta.mail.Session
 import jakarta.mail.internet.MimeBodyPart
 import jakarta.mail.internet.MimeMessage
 import jakarta.mail.internet.MimeMultipart
 import jakarta.mail.util.ByteArrayDataSource
 import java.util.Properties
+import java.io.OutputStream
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
@@ -28,11 +32,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.eclipse.angus.mail.imap.IMAPStore
+import org.eclipse.angus.mail.imap.IMAPFolder
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.ZERO
 import kotlin.time.Duration.Companion.seconds
@@ -298,16 +305,62 @@ class FolderWatcherTest {
         assertFalse(requireNotNull(failure).recoverable)
     }
 
+    @Test
+    fun `managed watcher reopens when detachment races with folder closure`() = runBlocking {
+        val current = connection()
+        val attempts = AtomicInteger()
+        val race = IllegalStateException("provider state failure")
+
+        val delivered =
+            watchManagedConnections(MutableStateFlow(connected(current)), "INBOX", ZERO) {
+                    if (attempts.incrementAndGet() == 1) {
+                        flow {
+                            val folder = RaceFolder(current.store).apply { open(Folder.READ_ONLY) }
+                            val source = RacingMessage(folder, race)
+                            folder.close(false)
+                            val failure = assertFailsWith<FolderWatchException> {
+                                detachWatcherMessage(source, folder)
+                            }
+                            val closed = assertIs<FolderClosedException>(failure.cause)
+                            assertSame(race, closed.cause)
+                            throw failure
+                        }
+                    } else {
+                        flow {
+                            emit(message("recovered"))
+                            awaitCancellation()
+                        }
+                    }
+                }
+                .first()
+
+        assertEquals("recovered", delivered.subject)
+        assertEquals(2, attempts.get())
+    }
+
+    @Test
+    fun `watcher detachment keeps open-folder IllegalStateException terminal`() {
+        val current = connection()
+        val folder = RaceFolder(current.store).apply { open(Folder.READ_ONLY) }
+        val terminal = IllegalStateException("Folder not open")
+        val result = assertFailsWith<IllegalStateException> {
+            detachWatcherMessage(RacingMessage(folder, terminal), folder)
+        }
+        assertSame(terminal, result)
+        assertTrue(folder.isOpen)
+        folder.close(false)
+    }
+
     private fun connected(connection: MailConnection, reconnected: Boolean = false) =
         ManagedMailSessionState.Connected(connection, reconnected)
 
     private fun connection(): MailConnection {
-        val session = Session.getInstance(Properties())
+        val session = Session.getInstance(mailProperties())
         return MailConnection(session, session.getStore("imap") as IMAPStore)
     }
 
     private fun message(subject: String, attachment: String = "body"): MimeMessage {
-        val session = Session.getInstance(Properties())
+        val session = Session.getInstance(mailProperties())
         return MimeMessage(session).apply {
             this.subject = subject
             val text = MimeBodyPart().apply { setText("text") }
@@ -319,6 +372,31 @@ class FolderWatcherTest {
                 }
             setContent(MimeMultipart(text, file))
             saveChanges()
+        }
+    }
+
+    private class RaceFolder(store: IMAPStore) : IMAPFolder("INBOX", '/', store, false) {
+        private var opened = false
+        override fun open(mode: Int) { opened = true }
+        override fun close(expunge: Boolean) { opened = false }
+        override fun isOpen() = opened
+    }
+
+    private class RacingMessage(
+        folder: Folder,
+        private val failure: IllegalStateException,
+    ) : MimeMessage(folder, 1) {
+        override fun getFlags() = Flags()
+        override fun getSize() = -1
+        override fun writeTo(output: OutputStream) {
+            throw failure
+        }
+    }
+
+    companion object {
+        private fun mailProperties() = Properties().apply {
+            setProperty("mail.user", "test")
+            setProperty("mail.host", "localhost")
         }
     }
 }

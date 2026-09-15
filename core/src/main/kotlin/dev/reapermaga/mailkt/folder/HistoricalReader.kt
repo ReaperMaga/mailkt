@@ -117,6 +117,13 @@ internal const val SNAPSHOT_UID_BATCH_SIZE = 500
 private class SnapshotTimeoutException(budget: String, timeout: Duration) :
     TimeoutException("Range resolution exceeded $budget timeout $timeout")
 
+private class HistoricalIntegrityException(message: String) :
+    IllegalStateException(message), TerminalFolderFailure
+
+private inline fun ensureHistoricalIntegrity(condition: Boolean, message: () -> String) {
+    if (!condition) throw HistoricalIntegrityException(message())
+}
+
 internal fun historicalFlow(
     session: ManagedMailSession,
     name: String,
@@ -302,14 +309,19 @@ internal object ImapHistoricalTransport : HistoricalTransport {
         var failure: Throwable? = null
         try {
             folder.open(Folder.READ_ONLY)
-            val uids = folder as? UIDFolder ?: error("Server folder does not support stable UIDs")
-            check((folder as? org.eclipse.angus.mail.imap.IMAPFolder)?.uidNotSticky != true) {
+            val uids = folder as? UIDFolder
+                ?: throw HistoricalIntegrityException("Server folder does not support stable UIDs")
+            ensureHistoricalIntegrity(
+                (folder as? org.eclipse.angus.mail.imap.IMAPFolder)?.uidNotSticky != true
+            ) {
                 "Server does not preserve UIDs between folder opens"
             }
             return block(folder, uids)
         } catch (e: Throwable) {
-            failure = e
-            throw e
+            // Inspect the provider-owned state before this method's finally block closes it.
+            val normalized = normalizeClosedFolderFailure(folder, e)
+            failure = normalized
+            throw normalized
         } finally {
             try {
                 if (folder.isOpen) folder.close(false)
@@ -322,7 +334,7 @@ internal object ImapHistoricalTransport : HistoricalTransport {
     override fun snapshot(connection: MailConnection, name: String, range: HistoricalRange) =
         folder(connection, name) { folder, uids ->
             val validity = uids.uidValidity
-            check(validity > 0) { "Server returned invalid UIDVALIDITY" }
+            ensureHistoricalIntegrity(validity > 0) { "Server returned invalid UIDVALIDITY" }
             val messages = when (range) {
                 is HistoricalRange.Positions -> {
                     val count = folder.messageCount
@@ -343,28 +355,43 @@ internal object ImapHistoricalTransport : HistoricalTransport {
             val selected = ArrayList<Long>(ordered.size)
             for (batch in ordered.asSequence().chunked(SNAPSHOT_UID_BATCH_SIZE)) {
                 if (Thread.currentThread().isInterrupted) throw java.io.InterruptedIOException()
-                check(uids.uidValidity == validity) { "UIDVALIDITY changed during range resolution" }
-                check(batch.none { it.isExpunged }) { "Requested message was expunged during range resolution" }
+                ensureHistoricalIntegrity(uids.uidValidity == validity) {
+                    "UIDVALIDITY changed during range resolution"
+                }
+                ensureHistoricalIntegrity(batch.none { it.isExpunged }) {
+                    "Requested message was expunged during range resolution"
+                }
                 folder.fetch(batch.toTypedArray(), profile)
                 for (message in batch) {
-                    check(!message.isExpunged) { "Requested message was expunged during range resolution" }
+                    ensureHistoricalIntegrity(!message.isExpunged) {
+                        "Requested message was expunged during range resolution"
+                    }
                     val uid = uids.getUID(message)
-                    check(uid > 0) { "Requested message has no UID" }
+                    ensureHistoricalIntegrity(uid > 0) { "Requested message has no UID" }
                     selected += uid
                 }
             }
-            check(ordered.none { it.isExpunged }) { "Requested message was expunged during range resolution" }
-            check(uids.uidValidity == validity) { "UIDVALIDITY changed during range resolution" }
+            ensureHistoricalIntegrity(ordered.none { it.isExpunged }) {
+                "Requested message was expunged during range resolution"
+            }
+            ensureHistoricalIntegrity(uids.uidValidity == validity) {
+                "UIDVALIDITY changed during range resolution"
+            }
             HistoricalSnapshot(validity, selected)
         }
 
     override fun download(connection: MailConnection, name: String, validity: Long, uid: Long, limit: Long) =
         folder(connection, name) { _, uids ->
-            check(uids.uidValidity == validity) { "UIDVALIDITY changed; requested identities are invalid" }
-            val original = uids.getMessageByUID(uid) ?: error("Requested UID $uid was expunged")
-            check(!original.isExpunged) { "Requested UID $uid was expunged" }
+            ensureHistoricalIntegrity(uids.uidValidity == validity) {
+                "UIDVALIDITY changed; requested identities are invalid"
+            }
+            val original = uids.getMessageByUID(uid)
+                ?: throw HistoricalIntegrityException("Requested UID $uid was expunged")
+            ensureHistoricalIntegrity(!original.isExpunged) { "Requested UID $uid was expunged" }
             val received = original.receivedDate?.toInstant()
-            check(original.size.toLong() <= limit) { "Message exceeds maxMessageBytes=$limit" }
+            ensureHistoricalIntegrity(original.size.toLong() <= limit) {
+                "Message exceeds maxMessageBytes=$limit"
+            }
             val bytes = ByteArrayOutputStream()
             val bounded = object : OutputStream() {
                 private var size = 0L

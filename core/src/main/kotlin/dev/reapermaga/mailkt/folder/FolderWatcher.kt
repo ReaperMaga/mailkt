@@ -226,11 +226,20 @@ private fun watchConnection(
                 launch(ioDispatcher) {
                     try {
                         for (message in pending) {
-                            val uid = (lifecycle.folder as? UIDFolder)?.getUID(message)
-                            if (checkpoint.wasDelivered(uid)) continue
-                            val detached = runInterruptible { detachMessage(message) }
-                            send(detached)
-                            checkpoint.markDelivered(uid)
+                            val sourceFolder = message.folder ?: lifecycle.folder
+                            try {
+                                val uid = (lifecycle.folder as? UIDFolder)?.getUID(message)
+                                if (checkpoint.wasDelivered(uid)) continue
+                                val detached = runInterruptible {
+                                    detachWatcherMessage(message, sourceFolder)
+                                }
+                                send(detached)
+                                checkpoint.markDelivered(uid)
+                            } catch (exception: IllegalStateException) {
+                                // Normalize while the worker can still observe the source folder;
+                                // awaitClose cleanup may close it after this block exits.
+                                throw normalizeClosedFolderFailure(sourceFolder, exception)
+                            }
                         }
                     } catch (exception: CancellationException) {
                         throw exception
@@ -337,6 +346,17 @@ internal fun detachMessage(message: Message): MimeMessage =
     when (message) {
         is MimeMessage -> MimeMessage(message)
         else -> throw MessagingException("Only MIME messages can be detached safely")
+    }
+
+internal fun detachWatcherMessage(message: Message, sourceFolder: Folder?): MimeMessage =
+    try {
+        detachMessage(message)
+    } catch (exception: IllegalStateException) {
+        val normalized = normalizeClosedFolderFailure(sourceFolder, exception)
+        if (normalized is FolderClosedException) {
+            throw FolderWatchException("Source folder closed while detaching message", normalized)
+        }
+        throw normalized
     }
 
 private fun validateArguments(name: String, bufferCapacity: Int) {
