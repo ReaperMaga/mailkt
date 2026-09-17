@@ -222,6 +222,169 @@ No consumer API changes are required: continue sharing the same managed handle b
 is internal. Keep sender checks, PDF/AI processing, and other consumer work inside `collect`; those
 operations remain outside the reader's download/recovery budgets. Timeout defaults are unchanged.
 
+## Conversation APIs
+
+These extensions stay independent of companies, invoice parsing, persistence, AI, and application
+authorization. Existing reading/watching APIs are unchanged. All examples below use the same
+`ManagedMailSession` returned by your session manager; no second credential store is needed.
+
+```kotlin
+import dev.reapermaga.mailkt.message.*
+import dev.reapermaga.mailkt.folder.*
+
+val draft = composeMessage(
+    from = "me@example.com",
+    to = listOf("contact@example.com"),
+    subject = "Invoice question",
+    text = "Please resend the invoice with the correct billing address.",
+)
+// Persist the draft, its Message-ID, and an UNKNOWN attempt state before submission.
+val result = managed.sendMessage(draft)
+when (result.status) {
+    SendStatus.ACCEPTED -> { /* Persist outgoing history; service accepted, delivery unconfirmed. */ }
+    SendStatus.FAILED -> { /* Preserve draft; show failure. */ }
+    SendStatus.UNKNOWN -> { /* Reconcile by Message-ID; do not automatically retry. */ }
+}
+
+val reply = composeReply(originalMessage, "me@example.com", "Thank you", replyAll = false)
+// Review recipients before calling managed.sendMessage(reply).
+
+val filter = MessageFilter(
+    addresses = setOf("contact@example.com"),
+    threadMessageIds = setOf("<known-thread-message@example.com>"),
+)
+var page = readMessagePage(managed, "INBOX", filter)
+// Persist/process page.messages. Load older pages on demand:
+while (page.nextCursor != null) {
+    page = readMessagePage(managed, "INBOX", filter, cursor = page.nextCursor)
+}
+// After processing ALL pages, checkpoint page.uidValidity and page.snapshotUpperUid.
+val arrivals = readMessagePage(
+    managed, "INBOX", filter,
+    afterUid = page.snapshotUpperUid,
+    expectedUidValidity = page.uidValidity,
+)
+// Also drain arrivals.nextCursor before advancing the checkpoint.
+```
+
+`composeMessage` supports To/Cc/Bcc, UTF-8 subject/text and generates a Message-ID. `composeReply`
+respects Reply-To and builds In-Reply-To/References; reply-all removes the sending mailbox and Bcc.
+Messages remain Jakarta `MimeMessage` objects, so MIME bodies and attachments can also be composed
+through Jakarta APIs. Do not mutate a draft during submission. Sending finalizes MIME headers
+without changing its existing Message-ID. Message-ID is a reconciliation key, not an SMTP
+idempotency guarantee. Cancellation or a process crash can leave submission unknown; no send
+operation retries automatically. Prevent concurrent duplicate submissions in your backend.
+
+### Assembled conversation history
+
+```kotlin
+val history = readConversations(
+    session = managed,
+    folderNames = listOf("INBOX", sentFolderName),
+    contacts = setOf("contact@example.com"),
+)
+// history.threads contains separate email threads with chronological messages.
+// Each message exposes its MIME content, timestamp, unread state and all mailbox copies/locations.
+val older = readConversations(
+    managed, listOf("INBOX", sentFolderName), setOf("contact@example.com"),
+    threadMessageIds = history.threads.flatMap { it.relatedMessageIds }.toSet(),
+    options = ConversationReadOptions(beforeUidByFolder = history.folders.associate {
+        it.folderName to it.lowerUid
+    }),
+)
+val combinedThreads = assembleConversations(
+    (history.threads + older.threads).flatMap { it.messages }.flatMap { it.copies },
+)
+```
+
+`readConversations` indexes only envelopes and threading headers for up to 2,000 recent UID
+positions per folder by default, then follows the transitive Message-ID/References/In-Reply-To
+relationships in that window, including ancestors and replies whose participants changed.
+It downloads only selected bodies, with defaults of 500 matching mailbox copies and 50 MiB total
+serialized MIME. Limits fail explicitly rather than returning silently incomplete threads.
+Include archive/custom folders if your application needs their history. Missing ancestors or
+stripped threading headers cannot be reconstructed by subject or shared domain.
+
+Folder snapshots expose `olderHistoryAvailable` and `lowerUid` for progressive loading with
+`beforeUidByFolder`. Replies outside a requested window are not included; expand the window or
+load more history. Pass known message IDs when loading older pages, and reassemble stored copies
+with new reads. For incremental updates, call `readMessagePage` with contacts plus all known thread
+IDs, retain folder locations, then call `assembleConversations` with stored and new copies. Older
+previously excluded messages may need a new bounded conversation read when a new reply establishes
+a relationship. Truncated conversation snapshots must not be treated as full-mailbox sync checkpoints.
+
+`assembleConversations` retains mailbox location/flag information and conservatively merges copies
+with the same Message-ID only if sender, To/Cc, subject, timestamp, reply headers, MIME type and body
+hash agree. Missing IDs remain separate, and conflicting same-ID content is retained. Accounts
+remain isolated; thread IDs are derived from known relationships and may change as older ancestors
+are discovered. Repeated locations use the last supplied copy, allowing flag updates from fresh reads.
+Neither function applies company ownership or renders/sanitizes HTML.
+
+Gmail and Outlook sessions configure SMTP with mandatory STARTTLS on port 587. Submission uses
+the current connected session's credentials and serializes with reconnect/disconnect. Each send
+opens/closes an SMTP transport underneath: IMAP itself cannot send mail. A disconnected account
+fails before submission. `MailSession.supportsSending` reports configured SMTP support, not
+granted consent or provider policy. The From address must equal the authenticated username;
+delegated Send As/alias sending is not supported. Custom `ImapMailSession` instances may opt in
+with `smtpConfig = SmtpConfig("smtp.example.com")`.
+
+For Outlook use `OutlookOAuth2Config.consumer(clientId, enableSending = true)` or add
+`https://outlook.office.com/SMTP.Send` to custom scopes. Existing read-only grants need new consent;
+refreshing an old token alone does not grant sending rights. Microsoft 365 may also require an
+administrator to enable authenticated SMTP for the mailbox. See
+[Microsoft OAuth protocol requirements](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth).
+Gmail's existing `https://mail.google.com/` scope covers IMAP and SMTP; see
+[Google XOAUTH2 documentation](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol).
+Connection success over IMAP does not prove SMTP authorization; surface authentication failures
+and reconnect with the additional consent when needed.
+
+`listMailFolders(managed.session)` returns names and IMAP SPECIAL-USE attributes such as `\\Sent`.
+Choose the provider's Sent folder and call `readMessagePage` on it as well as INBOX. Some servers
+omit SPECIAL-USE; let callers configure the folder instead of assuming an English name. SMTP
+does not universally save Sent copies. Persist accepted outgoing messages in the application;
+optionally use `appendSentMessage(managed, sentFolderName, draft)` for servers that do not save
+them. Do not append when the provider already saves a copy, and never resend because append failed.
+
+Each page examines at most 100 UID positions by default (configurable 1–500), newest-first for
+history and oldest-first for incremental reads. Address matching checks full From/To/Cc/Bcc
+addresses case-insensitively; it never matches a shared domain or subject. Explicit Message-ID,
+In-Reply-To and References tokens are alternatives to address matching. Expanding thread membership
+requires the caller to collect discovered IDs and perform a new filtered scan where necessary.
+Filtering reads envelopes/selected headers within the bounded UID window before downloading matching
+bodies. It is not a provider conversation index or a global server SEARCH. Sparse or filtered pages
+can be empty with a next cursor. Keep the same filter throughout a scan; new arrivals are outside
+its fixed snapshot. Cursors are scoped by session ID and folder: use a stable account ID across
+restarts, and validate cursor input in your backend. UIDVALIDITY changes require resynchronization.
+Expunged messages absent before selection are skipped. Reads fail explicitly on connection/provider
+errors; retry the same cursor after reconnect instead of advancing the checkpoint.
+
+Pages return detached `HistoricalMessage` MIME copies with UID, UIDVALIDITY, server received time,
+and copied flags, so content remains accessible after folders close. Defaults cap each message at
+25 MiB and the total serialized page at 50 MiB; decrease `uidWindowSize` if a page hits the cap.
+Decoded MIME and temporary copies require additional heap. Deduplicate folder items by
+`(account, folder, uidValidity, uid)` and reconcile sent copies by account/Message-ID where available.
+Handle missing/colliding Message-IDs explicitly. Persist checkpoints only after downstream work
+succeeds. Existing managed watchers can notify new arrivals; use page UIDs for durable catch-up.
+
+Company contact ambiguity, access checks, safe HTML rendering, tracking-image blocking, quoted-text
+collapsing, drafts and AI belong in Rechnungsradar. A contact filter is not authorization; never
+expose unfiltered mailbox access to company-scoped users. These APIs log no message bodies or tokens;
+avoid logging provider exception contents without redaction.
+
+This working tree extends the existing `ReaperMaga/mailkt` repository on `main`; no remote fork or
+release has been created. To consume a local development version:
+
+```powershell
+./gradlew.bat :core:publishToMavenLocal :gmail:publishToMavenLocal :outlook:publishToMavenLocal -Pbuild.version=0.1.1-conversations-SNAPSHOT
+```
+
+Add `mavenLocal()` to the consuming project's repositories and depend on
+`dev.reapermaga.mailkt:core:0.1.1-conversations-SNAPSHOT` and the corresponding provider module.
+Rechnungsradar is not present in this workspace; its integration and real-account send/reply
+verification must be performed there. Library tests exercise protocol configuration, submission
+outcomes, reply relationships, exact matching, bounded paging, cursor validity and detached content
+without accessing real mailboxes.
+
 ## Build
 
 On Windows:

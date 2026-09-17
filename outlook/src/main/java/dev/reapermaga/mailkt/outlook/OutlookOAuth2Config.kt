@@ -12,11 +12,14 @@ data class OutlookOAuth2Config(
     }
 
     companion object {
-        fun consumer(clientId: String) =
+        fun consumer(clientId: String, enableSending: Boolean = false) =
             OutlookOAuth2Config(
                 clientId,
                 "https://login.microsoftonline.com/consumers",
-                setOf("https://outlook.office.com/IMAP.AccessAsUser.All"),
+                buildSet {
+                    add("https://outlook.office.com/IMAP.AccessAsUser.All")
+                    if (enableSending) add("https://outlook.office.com/SMTP.Send")
+                },
             )
     }
 }

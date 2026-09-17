@@ -9,7 +9,8 @@ import java.util.UUID
 class OutlookMailSession(
     id: String = UUID.randomUUID().toString(),
     ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-) : ImapMailSession(host = HOST, ioDispatcher = ioDispatcher, id = id) {
+) : ImapMailSession(host = HOST, ioDispatcher = ioDispatcher, id = id,
+    smtpConfig = dev.reapermaga.mailkt.message.SmtpConfig("smtp.office365.com")) {
     companion object {
         const val HOST = "outlook.office365.com"
     }

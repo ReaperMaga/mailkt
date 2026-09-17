@@ -9,7 +9,8 @@ import java.util.UUID
 class GmailMailSession(
     id: String = UUID.randomUUID().toString(),
     ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-) : ImapMailSession(host = HOST, ioDispatcher = ioDispatcher, id = id) {
+) : ImapMailSession(host = HOST, ioDispatcher = ioDispatcher, id = id,
+    smtpConfig = dev.reapermaga.mailkt.message.SmtpConfig("smtp.gmail.com")) {
     companion object {
         const val HOST = "imap.gmail.com"
     }

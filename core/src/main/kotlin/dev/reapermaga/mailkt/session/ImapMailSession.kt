@@ -19,12 +19,24 @@ open class ImapMailSession(
     private val supportedAuthMethods: Set<MailAuthMethod> = setOf(MailAuthMethod.OAUTH2),
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     override val id: String = UUID.randomUUID().toString(),
+    val smtpConfig: dev.reapermaga.mailkt.message.SmtpConfig? = null,
 ) : MailSession {
 
     private val lifecycleMutex = Mutex()
 
     @Volatile
     private var connection: MailConnection? = null
+
+    private var sendingCredentials: MailCredentials? = null
+
+    /** Serializes sending with credential replacement and disconnect; never retries submission. */
+    suspend fun sendMessage(message: jakarta.mail.internet.MimeMessage): dev.reapermaga.mailkt.message.SendResult =
+        lifecycleMutex.withLock {
+            check(isConnected) { "Mail session is not connected" }
+            val config = checkNotNull(smtpConfig) { "SMTP sending is not configured" }
+            val credentials = checkNotNull(sendingCredentials)
+            dev.reapermaga.mailkt.message.submitMessage(config, credentials, message, ioDispatcher)
+        }
 
     override val currentConnection: MailConnection?
         get() = connection
@@ -61,6 +73,7 @@ open class ImapMailSession(
             val previous = connection
             val established = MailConnection(candidateSession, candidateStore)
             connection = established
+            sendingCredentials = credentials
             previous?.store?.let { oldStore ->
                 try {
                     runInterruptible(ioDispatcher) { oldStore.close() }
@@ -78,6 +91,7 @@ open class ImapMailSession(
             lifecycleMutex.withLock {
                 val previous = connection ?: return@withLock
                 connection = null
+                sendingCredentials = null
                 runInterruptible(ioDispatcher) {
                     if (previous.store.isConnected) previous.store.close()
                 }
