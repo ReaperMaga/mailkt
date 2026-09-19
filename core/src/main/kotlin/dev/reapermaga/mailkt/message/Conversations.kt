@@ -7,11 +7,24 @@ import jakarta.mail.internet.InternetAddress
 import jakarta.mail.internet.MimeMessage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withTimeout
+import org.slf4j.LoggerFactory
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.FilterOutputStream
+import java.net.SocketException
+import java.net.SocketTimeoutException
+import java.util.Collections
+import java.util.IdentityHashMap
+import javax.net.ssl.SSLException
 import java.time.Instant
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 
 data class MessageLocation(val accountId: String, val folderName: String, val uidValidity: Long, val uid: Long)
 
@@ -44,6 +57,8 @@ data class ConversationSyncMetrics(
     val messageLookupCommands: Int,
     val fullMessageFetchCommands: Int,
     val downloadedBytes: Long,
+    val recoveryAttempts: Int = 0,
+    val successfulRecoveries: Int = 0,
 ) {
     val totalFetchCommands: Int get() = folderIndexCommands + envelopeFetchCommands +
         messageLookupCommands + fullMessageFetchCommands
@@ -71,11 +86,19 @@ data class ConversationReadOptions(
     val fullMessageBatchSize: Int = 25,
     /** Exclusive per-folder boundary for progressive older history loading. */
     val beforeUidByFolder: Map<String, Long> = emptyMap(),
+    /** Number of managed-session reconnects allowed for one synchronization call. */
+    val maxRecoveryAttempts: Int = 2,
+    /** Delay between invalidating a failed connection and retrying on its replacement. */
+    val recoveryBackoff: Duration = 100.milliseconds,
+    /** Maximum time to wait for each replacement connection. */
+    val recoveryTimeout: Duration = 30.seconds,
 ) {
     init {
         require(maxUidPositionsPerFolder > 0 && maxMatchedMessages > 0)
         require(envelopeBatchSize in 1..500 && fullMessageBatchSize in 1..100)
         require(maxMessageBytes in 1..Int.MAX_VALUE.toLong() && maxTotalBytes > 0)
+        require(maxRecoveryAttempts >= 0)
+        require(!recoveryBackoff.isNegative() && recoveryTimeout.isPositive())
         require(beforeUidByFolder.all { (folder, uid) -> folder.isNotBlank() && uid > 0 })
     }
 }
@@ -185,7 +208,8 @@ suspend fun readConversations(
     contacts: Set<String>,
     threadMessageIds: Set<String> = emptySet(),
     options: ConversationReadOptions = ConversationReadOptions(),
-): ConversationHistory = readConversations(session.session, folderNames, contacts, threadMessageIds, options)
+): ConversationHistory = synchronizeConversations(session, folderNames, contacts, threadMessageIds,
+    options = options).history
 
 suspend fun synchronizeConversations(
     session: MailSession,
@@ -204,8 +228,145 @@ suspend fun synchronizeConversations(
     threadMessageIds: Set<String> = emptySet(),
     cursor: ConversationSyncCursor? = null,
     options: ConversationReadOptions = ConversationReadOptions(),
-): ConversationSyncResult = synchronizeConversations(session.session, folderNames, contacts,
-    threadMessageIds, cursor, options)
+): ConversationSyncResult = synchronizeConversations(session, folderNames, contacts,
+    threadMessageIds, cursor, options, ImapConversationTransport)
+
+private val conversationLogger = LoggerFactory.getLogger("dev.reapermaga.mailkt.message.Conversations")
+
+private class PinnedMailSession(
+    private val delegate: MailSession,
+    override val currentConnection: MailConnection,
+) : MailSession {
+    override val id: String get() = delegate.id
+    override val isConnected: Boolean get() = currentConnection.store.isConnected
+    override suspend fun connect(credentials: MailCredentials): MailConnection =
+        error("A pinned managed-session generation cannot connect")
+    override suspend fun disconnect() = Unit
+}
+
+private class ConversationTransportException(
+    val folderName: String,
+    val phase: String,
+    cause: Throwable,
+) : RuntimeException(cause)
+
+private fun conversationExceptionChain(failure: Throwable): List<Throwable> {
+    val visited = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
+    fun walk(current: Throwable?) {
+        if (current == null || !visited.add(current) || current is CancellationException) return
+        walk(current.cause)
+        if (current is MessagingException) walk(current.nextException)
+    }
+    walk(failure)
+    return visited.toList()
+}
+
+private fun conversationRecoveryReason(failure: Throwable): ManagedMailSession.RecoveryReason? {
+    val chain = conversationExceptionChain(failure)
+    return when {
+        chain.any { it is StoreClosedException } -> ManagedMailSession.RecoveryReason.STORE_CLOSED
+        chain.any { it is FolderClosedException } -> ManagedMailSession.RecoveryReason.FOLDER_CLOSED
+        chain.any { it is SSLException || it is SocketException || it is SocketTimeoutException } ->
+            ManagedMailSession.RecoveryReason.SOCKET_FAILURE
+        else -> null
+    }
+}
+
+private fun conversationFailureContext(failure: Throwable): Pair<String, String> {
+    val contextual = conversationExceptionChain(failure).filterIsInstance<ConversationTransportException>().firstOrNull()
+    return (contextual?.folderName ?: "<unknown>") to (contextual?.phase ?: "synchronization")
+}
+
+internal suspend fun synchronizeConversations(
+    session: ManagedMailSession,
+    folderNames: List<String>,
+    contacts: Set<String>,
+    threadMessageIds: Set<String>,
+    cursor: ConversationSyncCursor?,
+    options: ConversationReadOptions,
+    transport: ConversationTransport,
+): ConversationSyncResult {
+    require(cursor == null || cursor.accountId == session.session.id) { "Conversation cursor belongs to another account" }
+    var recoveries = 0
+    while (true) {
+        currentCoroutineContext().ensureActive()
+        val generation = session.generation()
+        val pinned = PinnedMailSession(session.session, generation.connection)
+        try {
+            val result = synchronizeConversations(pinned, folderNames, contacts, threadMessageIds,
+                cursor, options, transport)
+            if (recoveries > 0) {
+                conversationLogger.info(
+                    "Conversation recovery session={} attempts={} outcome=succeeded generation={}",
+                    session.session.id, recoveries, generation.number,
+                )
+            }
+            return result.copy(metrics = result.metrics.copy(
+                recoveryAttempts = recoveries,
+                successfulRecoveries = recoveries,
+            ))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            currentCoroutineContext().ensureActive()
+            val reason = conversationRecoveryReason(e)
+            val (reportedFolder, phase) = conversationFailureContext(e)
+            val folder = if (reportedFolder == "<unknown>" && folderNames.size == 1) folderNames.single()
+                else reportedFolder
+            if (reason == null) throw e
+            val nextRecovery = recoveries + 1
+            val accepted = session.requestRecovery(generation, reason)
+            conversationLogger.warn(
+                "Conversation recovery session={} folder={} phase={} attempt={} generation={} reason={} outcome={}",
+                session.session.id, folder, phase, nextRecovery, generation.number, reason,
+                if (accepted) "requested" else "coalesced-or-stale",
+            )
+            try {
+                runInterruptible(Dispatchers.IO) { generation.connection.store.close() }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (closeFailure: Throwable) {
+                conversationLogger.debug(
+                    "Conversation recovery session={} generation={} failed-store-close={}",
+                    session.session.id, generation.number, closeFailure.javaClass.name,
+                )
+            }
+            if (recoveries >= options.maxRecoveryAttempts) {
+                val failed = (e as? ConversationSyncException)?.failedLocations.orEmpty()
+                throw ConversationSyncException(
+                    "Conversation synchronization failed for folder '$folder' during $phase after $recoveries retries",
+                    cursor ?: ConversationSyncCursor(session.session.id, emptyMap()), failed, e,
+                )
+            }
+            try {
+                delay(options.recoveryBackoff)
+                withTimeout(options.recoveryTimeout) {
+                    while (true) {
+                        currentCoroutineContext().ensureActive()
+                        when (val state = session.state.value) {
+                            is ManagedMailSessionState.Connected ->
+                                if (session.generation() !== generation) return@withTimeout
+                            is ManagedMailSessionState.Stopped ->
+                                throw IllegalStateException("Managed session stopped during conversation recovery", state.cause)
+                            else -> Unit
+                        }
+                        delay(options.recoveryBackoff.coerceAtLeast(1.milliseconds))
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (recoveryFailure: Throwable) {
+                recoveryFailure.addSuppressed(e)
+                throw ConversationSyncException(
+                    "Conversation synchronization failed for folder '$folder' during $phase while waiting for retry $nextRecovery",
+                    cursor ?: ConversationSyncCursor(session.session.id, emptyMap()),
+                    (e as? ConversationSyncException)?.failedLocations.orEmpty(), recoveryFailure,
+                )
+            }
+            recoveries = nextRecovery
+        }
+    }
+}
 
 internal suspend fun readConversations(session: MailSession, folderNames: List<String>, contacts: Set<String>,
     threadMessageIds: Set<String>, options: ConversationReadOptions, transport: ConversationTransport): ConversationHistory =
@@ -250,8 +411,9 @@ internal suspend fun synchronizeConversations(session: MailSession, folderNames:
     } catch (e: CancellationException) {
         throw e
     } catch (e: Throwable) {
+        val batchFailure = conversationExceptionChain(e).filterIsInstance<ConversationBatchException>().firstOrNull()
         throw ConversationSyncException("Conversation batch download failed; retry from the supplied cursor",
-            retryCursor, (e as? ConversationBatchException)?.failedLocations ?: selected.map { it.location }, e)
+            retryCursor, batchFailure?.failedLocations ?: selected.map { it.location }, e)
     }
     val assemblyStarted = System.nanoTime()
     val threads = assembleConversations(download.messages)
@@ -337,6 +499,11 @@ private object ImapConversationTransport : ConversationTransport {
                     val processedUpper = if (upper >= lower) upper else previous?.highestProcessedUid ?: serverUpper
                     nextFolders[name] = ConversationFolderCursor(validity, processedUpper)
                     ConversationFolderSnapshot(name, validity, maxOf(0, upper), !incremental && lower > 1, maxOf(1, lower))
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    if (Thread.currentThread().isInterrupted) throw e
+                    throw ConversationTransportException(name, "header indexing", e)
                 } finally { runCatching { if (folder.isOpen) folder.close(false) } }
             }
             ConversationIndex(envelopes, snapshots, nextFolders, resetFolders, folderNanos,
@@ -404,6 +571,11 @@ private object ImapConversationTransport : ConversationTransport {
                     }
                 }
                 check(uids.uidValidity == validity) { "UIDVALIDITY changed during conversation download" }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                if (Thread.currentThread().isInterrupted) throw e
+                throw ConversationTransportException(folderName, "full-message fetching", e)
             } finally { runCatching { if (folder.isOpen) folder.close(false) } }
         }
         ConversationDownload(envelopes.map { envelope ->
