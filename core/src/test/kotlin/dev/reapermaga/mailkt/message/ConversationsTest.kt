@@ -3,7 +3,9 @@ package dev.reapermaga.mailkt.message
 import dev.reapermaga.mailkt.folder.HistoricalMessage
 import dev.reapermaga.mailkt.folder.MessagePagesTest
 import jakarta.mail.internet.MimeMessage
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
+import java.io.OutputStream
 import java.util.Date
 import kotlin.test.*
 
@@ -86,5 +88,125 @@ class ConversationsTest {
         assertEquals(1, merged.size)
         assertEquals(2, merged.single().messages.size)
         assertFalse(merged.single().messages.last().unread)
+    }
+
+    @Test fun `full messages are fetched in bounded batches with identical grouping`() = runBlocking {
+        val batched = MessagePagesTest.Fixture()
+        repeat(60) { index -> batched.rows[(index + 1).toLong()] = mail("<message-$index@example.com>") }
+        batched.nextUid = 61
+        val optimized = synchronizeConversations(batched, listOf("INBOX"), setOf("contact@example.com"),
+            options = ConversationReadOptions(fullMessageBatchSize = 20))
+
+        val legacyShape = MessagePagesTest.Fixture()
+        legacyShape.rows.putAll(batched.rows.mapValues { MimeMessage(it.value) })
+        legacyShape.nextUid = 61
+        val individual = synchronizeConversations(legacyShape, listOf("INBOX"), setOf("contact@example.com"),
+            options = ConversationReadOptions(fullMessageBatchSize = 1))
+
+        assertEquals(3, optimized.metrics.fullMessageFetchCommands)
+        assertEquals(60, individual.metrics.fullMessageFetchCommands)
+        assertEquals(individual.history.threads.map { it.id }, optimized.history.threads.map { it.id })
+        assertEquals(individual.history.threads.flatMap { it.messages }.map { it.message.messageID },
+            optimized.history.threads.flatMap { it.messages }.map { it.message.messageID })
+        assertEquals(0, batched.opened)
+    }
+
+    @Test fun `incremental cursor fetches only new UIDs and UIDVALIDITY reset rescans safely`() = runBlocking {
+        val fixture = MessagePagesTest.Fixture().apply {
+            rows[1] = mail("<one@example.com>")
+            rows[2] = mail("<two@example.com>")
+            nextUid = 3
+        }
+        val initial = synchronizeConversations(fixture, listOf("INBOX"), setOf("contact@example.com"))
+        fixture.windows.clear()
+        fixture.rows[3] = mail("<three@example.com>")
+        fixture.nextUid = 4
+        val incremental = synchronizeConversations(fixture, listOf("INBOX"), setOf("contact@example.com"),
+            cursor = initial.cursor)
+        assertEquals(listOf(3L..3L, 3L..3L), fixture.windows)
+        assertEquals(listOf("<three@example.com>"), incremental.history.threads.flatMap { it.messages }
+            .map { it.message.messageID })
+        assertEquals(3, incremental.cursor.folders.getValue("INBOX").highestProcessedUid)
+
+        fixture.windows.clear()
+        fixture.validity = 11
+        val reset = synchronizeConversations(fixture, listOf("INBOX"), setOf("contact@example.com"),
+            cursor = incremental.cursor, options = ConversationReadOptions(maxUidPositionsPerFolder = 2))
+        assertEquals(setOf("INBOX"), reset.uidValidityResetFolders)
+        assertEquals(11, reset.cursor.folders.getValue("INBOX").uidValidity)
+        assertEquals(2L..3L, fixture.windows.first())
+        assertEquals(0, fixture.opened)
+    }
+
+    @Test fun `partial batch failure keeps retry cursor and closes folder`() = runBlocking {
+        val fixture = MessagePagesTest.Fixture().apply {
+            repeat(5) { index -> rows[(index + 1).toLong()] = mail("<failure-$index@example.com>") }
+            nextUid = 6
+        }
+        val checkpoint = ConversationSyncCursor("account", mapOf("INBOX" to ConversationFolderCursor(10, 0)))
+        fixture.failFullMessageFetchAt = 2
+        val failure = assertFailsWith<ConversationSyncException> {
+            synchronizeConversations(fixture, listOf("INBOX"), setOf("contact@example.com"),
+                cursor = checkpoint, options = ConversationReadOptions(fullMessageBatchSize = 2))
+        }
+        assertEquals(checkpoint, failure.retryCursor)
+        assertEquals(listOf(3L, 4L), failure.failedLocations.map { it.uid })
+        assertEquals(0, fixture.opened)
+    }
+
+    @Test fun `cancellation is not converted to partial synchronization`() = runBlocking<Unit> {
+        val fixture = MessagePagesTest.Fixture().apply { rows[1] = mail("<cancel@example.com>"); nextUid = 2 }
+        val transport = object : ConversationTransport {
+            override suspend fun index(session: dev.reapermaga.mailkt.session.MailSession, folders: List<String>,
+                options: ConversationReadOptions, cursor: ConversationSyncCursor?) = ConversationIndex(
+                listOf(ConversationEnvelope(MessageLocation(session.id, "INBOX", 10, 1),
+                    setOf("contact@example.com"), setOf("<cancel@example.com>"))),
+                listOf(ConversationFolderSnapshot("INBOX", 10, 1, false)),
+                mapOf("INBOX" to ConversationFolderCursor(10, 1)))
+            override suspend fun download(session: dev.reapermaga.mailkt.session.MailSession,
+                envelopes: List<ConversationEnvelope>, options: ConversationReadOptions): ConversationDownload =
+                throw CancellationException("cancelled")
+        }
+        assertFailsWith<CancellationException> {
+            synchronizeConversations(fixture, listOf("INBOX"), setOf("contact@example.com"),
+                emptySet(), null, ConversationReadOptions(), transport)
+        }
+    }
+
+    @Test fun `malformed message fails explicitly without leaking folder`() = runBlocking {
+        val fixture = MessagePagesTest.Fixture()
+        fixture.rows[1] = object : MimeMessage(mail("<malformed@example.com>")) {
+            override fun writeTo(output: OutputStream) = throw jakarta.mail.MessagingException("malformed body")
+        }
+        fixture.nextUid = 2
+        val failure = assertFailsWith<ConversationSyncException> {
+            synchronizeConversations(fixture, listOf("INBOX"), setOf("contact@example.com"))
+        }
+        assertEquals(listOf(1L), failure.failedLocations.map { it.uid })
+        assertEquals(0, fixture.opened)
+    }
+
+    @Test fun `two thousand UID performance comparison reduces delayed fetch runtime`() = runBlocking {
+        suspend fun measured(batchSize: Int): ConversationSyncResult {
+            val fixture = MessagePagesTest.Fixture().apply {
+                repeat(2000) { index ->
+                    rows[(index + 1).toLong()] = mail("<benchmark-$index@example.com>",
+                        sender = if (index % 20 == 0) "contact@example.com" else "other@example.com")
+                }
+                nextUid = 2001
+                fullMessageFetchDelayMillis = 1
+            }
+            return synchronizeConversations(fixture, listOf("INBOX"), setOf("contact@example.com"),
+                options = ConversationReadOptions(fullMessageBatchSize = batchSize))
+        }
+        val individual = measured(1)
+        val batched = measured(25)
+        assertEquals(100, individual.metrics.fullMessageFetchCommands)
+        assertEquals(4, batched.metrics.fullMessageFetchCommands)
+        assertTrue(batched.metrics.fullMessageDownloadNanos < individual.metrics.fullMessageDownloadNanos)
+        println("Conversation benchmark: individual=${individual.metrics.totalFetchCommands} commands/" +
+            "${individual.metrics.fullMessageDownloadNanos / 1_000_000}ms, " +
+            "batched=${batched.metrics.totalFetchCommands} commands/" +
+            "${batched.metrics.fullMessageDownloadNanos / 1_000_000}ms")
     }
 }

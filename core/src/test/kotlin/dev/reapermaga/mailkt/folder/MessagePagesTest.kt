@@ -19,6 +19,10 @@ class MessagePagesTest {
         var opened = 0
         val windows = mutableListOf<LongRange>()
         val appended = mutableListOf<Message>()
+        var envelopeFetches = 0
+        var fullMessageFetches = 0
+        var fullMessageFetchDelayMillis = 0L
+        var failFullMessageFetchAt: Int? = null
         val store = object : IMAPStore(jakarta, null) {
             override fun isConnected() = true
             override fun getFolder(name: String): Folder = object : IMAPFolder(name, '/', this, false) {
@@ -33,8 +37,18 @@ class MessagePagesTest {
                     windows += start..end
                     return rows.filterKeys { it in start..end }.values.toTypedArray()
                 }
+                override fun getMessagesByUID(uids: LongArray): Array<Message> {
+                    if (uids.isNotEmpty()) windows += uids.min()..uids.max()
+                    return uids.asSequence().mapNotNull { rows[it] }.toList().toTypedArray()
+                }
                 override fun getUID(message: Message) = rows.entries.first { it.value === message }.key
-                override fun fetch(messages: Array<out Message>, profile: FetchProfile) {}
+                override fun fetch(messages: Array<out Message>, profile: FetchProfile) {
+                    if (profile.contains(IMAPFolder.FetchProfileItem.MESSAGE)) {
+                        fullMessageFetches++
+                        if (fullMessageFetchDelayMillis > 0) Thread.sleep(fullMessageFetchDelayMillis)
+                        if (failFullMessageFetchAt == fullMessageFetches) error("simulated partial batch failure")
+                    } else envelopeFetches++
+                }
                 override fun appendMessages(messages: Array<out Message>) { appended.addAll(messages) }
             }
         }
