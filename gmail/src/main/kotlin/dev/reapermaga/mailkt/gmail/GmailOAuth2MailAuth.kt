@@ -127,8 +127,11 @@ class GmailOAuth2MailAuth(
         }
     }
 
-    private class GmailUserInfo {
-        @Key var email: String? = null
+    // Must be accessible outside this module: google-http-client's JsonParser instantiates this
+    // class and populates its @Key field via reflection, which fails against a private nested class
+    // or a Kotlin-generated private backing field.
+    internal class GmailUserInfo {
+        @JvmField @Key var email: String? = null
     }
 
     companion object {
