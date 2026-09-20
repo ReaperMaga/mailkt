@@ -26,7 +26,7 @@ interface Mailbox {
 ```
 
 - `Folders` lists folders, resolves special-use folders, and appends messages.
-- `Messages` pages, streams, and watches detached `LocatedMessage` values.
+- `Messages` pages, streams, and watches mailbox content using an envelope-first pipeline.
 - `Conversations` reads, synchronizes, and assembles conversations.
 - `Outbox` creates drafts/replies and submits them with explicit `ACCEPTED`, `FAILED`, or `UNKNOWN` results.
 - Public models include `MailMessage`, MIME content/attachments, addresses, flags, locations, cursors, drafts, and conversations. Jakarta/Angus types are never exposed.
@@ -68,6 +68,48 @@ The hosted flow follows the providers' web-server authorization-code guidance:
 - [Exchange OAuth documentation](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth)
 
 Exchange IMAP and SMTP delegated scopes remain unchanged.
+
+## Envelope-First Reading and Watching
+
+Represent lightweight metadata, MIME structure, and downloaded content separately:
+
+- `MessageEnvelope` contains location, UID/UIDVALIDITY, Message-ID relationships, addresses, subject, dates, flags, content type, and advertised size, but no body or attachment bytes.
+- `MessageStructure` is a tree of `MessagePartDescriptor` values containing stable part references, media type, disposition, filename, content ID, transfer encoding, and advertised size, but no part bytes.
+- `MailMessage` contains the immutable decoded body/content tree and attachments in addition to its envelope.
+- `MessageQuery` contains only predicates that can be evaluated from envelope data, such as folder, date, addresses, flags, subject, headers, thread IDs, and advertised size. Body- or attachment-content filtering is explicitly post-download.
+
+All primary read paths use two phases:
+
+1. Freeze the requested UID/date/position membership where snapshot semantics require it.
+2. Fetch envelope fields in bounded batches.
+3. Apply `MessageQuery` or caller application logic before requesting MIME structure, bodies, or attachment bytes.
+4. When needed, fetch MIME structure metadata and filter by attachment filename, disposition, media type, or advertised size without downloading part contents.
+5. Download only selected body or attachment parts, or request a complete `MailMessage` when the whole message is genuinely needed.
+
+`Messages` exposes envelope-only operations, structure lookup, selective part download, and full-message convenience operations. `MessagePartRef` includes the mailbox/folder/UIDVALIDITY/UID identity plus the MIME section identifier, and can only be used with its originating mailbox. Part downloads require an explicit byte limit and return detached MailKT content, never a live Jakarta stream.
+
+Callers may list/watch envelopes, apply arbitrary application-specific rules, inspect structure for matching envelopes, and download only the required parts. Full-message streams perform envelope filtering internally for simpler use cases. Live IDLE notifications must fetch and filter the envelope before requesting structure or content. Historical scans must preserve their fixed snapshot and ordering even when most envelopes are filtered out.
+
+The Rechnungsradar-style ingestion path should therefore be expressible without MailKT knowing application rules:
+
+```kotlin
+mailbox.messages.envelopes(selection).collect { envelope ->
+    val candidates = ingestionRules.findCandidates(envelope.from, envelope.subject)
+    if (candidates.isEmpty()) return@collect
+
+    val structure = mailbox.messages.structure(envelope.location)
+    structure.attachments
+        .filter { it.isPdf && ingestionRules.matchesFilename(candidates, it.fileName) }
+        .forEach { part ->
+            val pdf = mailbox.messages.download(part.ref, maxBytes = MAX_PDF_BYTES)
+            processPdf(pdf)
+        }
+}
+```
+
+The same pipeline applies to watched arrivals and historical date/position selections. Sender/subject rejection performs no MIME structure or content fetch; filename/type rejection performs no attachment-content fetch; only PDFs that survive both stages are downloaded.
+
+If a matching message is expunged, UIDVALIDITY changes, or a MIME part changes between envelope/structure selection and content download, return a typed unavailable/integrity failure according to the operation's snapshot contract; never silently substitute another message or part. Sparse pages and scans may produce no messages while still returning a continuation checkpoint.
 
 ## Persistence Boundary
 
@@ -204,7 +246,10 @@ Every slice must compile and pass the complete test suite before the next slice 
 
 - Preserve current behavior with characterization tests before replacing each subsystem.
 - Add transport contract tests using fake connections, folders, messages, and submissions.
-- Test MIME conversion, nested multipart content, attachments, encoded filenames, size limits, and malformed messages.
+- Test MIME conversion, structure-only inspection, nested multipart content, attachments, encoded filenames, size limits, selective part downloads, and malformed messages.
+- Verify that live watchers, historical date/position scans, pages, and conversation synchronization fetch envelope batches first and never request MIME structure, body, or attachment data for envelope-filtered messages.
+- Verify that attachment filename/type filtering uses structure metadata and never downloads rejected part bytes.
+- Test envelope-only consumption, structure-only consumption, selective PDF download, full-message convenience streams, sparse filtered pages, and expunge/UIDVALIDITY/part-change races between selection and content download.
 - Preserve recovery behavior for closed stores/folders, socket and TLS failures, timeouts, stale generations, concurrent recovery, and cancellation.
 - Preserve watcher catch-up, cleanup, duplicate suppression, and at-least-once delivery.
 - Preserve fixed historical snapshots, UIDVALIDITY integrity, bounded downloads, and non-retried consumer code.
@@ -229,6 +274,7 @@ Every slice must compile and pass the complete test suite before the next slice 
 - Angus is an `implementation` dependency rather than an `api` dependency.
 - No Jakarta or Angus type appears in the public API.
 - Consumer operations read naturally through `mailbox.folders`, `mailbox.messages`, `mailbox.conversations`, and `mailbox.outbox`.
+- Every reading and watching API can filter on envelope metadata before fetching MIME structure, then filter on part metadata before downloading bodies or attachments. Callers can consume envelopes or structures without downloading content.
 - Consumers never manage raw connections, session managers, or reconnect loops.
 - `Mailbox` is a complete lifecycle handle with deterministic state transitions, automatic generation-safe reconnection, explicit recovery after exhaustion, and idempotent resource cleanup.
 - Multiple user mailboxes can coexist concurrently; credentials, tokens, state, connections, recovery, cursors, and shutdown are isolated by `MailboxId`.
