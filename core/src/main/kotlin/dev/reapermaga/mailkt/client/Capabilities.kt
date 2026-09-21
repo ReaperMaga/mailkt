@@ -64,11 +64,18 @@ interface Conversations {
     /** Conversation containing [location], merged across copies. */
     suspend fun of(location: MessageLocation, maxMessages: Int = 200): Conversation
 
-    /** Incremental sync of [folder]; returns changed conversations and the next checkpoint. */
+    /**
+     * Incremental sync of [folder]; returns changed conversations and the next checkpoint.
+     *
+     * [query] narrows the membership server-side before any envelope is fetched. Callers that care
+     * about one correspondent should pass it rather than filtering the result, because an unfiltered
+     * sync has to fetch every envelope in the window to find out what it is.
+     */
     suspend fun synchronize(
         folder: FolderPath,
         from: ConversationCheckpoint? = null,
         maxMessages: Int = 500,
+        query: MessageQuery = MessageQuery.ALL,
     ): ConversationSync
 
     /** Groups already-fetched envelopes without contacting the server. */

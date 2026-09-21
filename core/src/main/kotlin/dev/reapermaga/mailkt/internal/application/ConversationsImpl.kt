@@ -25,7 +25,12 @@ internal class ConversationsImpl(private val rt: MailboxRuntime, private val mes
         return if (truncated) own.copy(truncated = true) else own
     }
 
-    override suspend fun synchronize(folder: FolderPath, from: ConversationCheckpoint?, maxMessages: Int): ConversationSync {
+    override suspend fun synchronize(
+        folder: FolderPath,
+        from: ConversationCheckpoint?,
+        maxMessages: Int,
+        query: MessageQuery,
+    ): ConversationSync {
         require(maxMessages > 0) { "maxMessages must be positive" }
         if (from != null) Checkpoints.validate(from, rt.key, folder)
         val head = rt.retrying("sync.head") { rt.withFolder(folder) { it.uidValidity to (it.uidNext - 1) } }
@@ -39,7 +44,7 @@ internal class ConversationsImpl(private val rt: MailboxRuntime, private val mes
         val uids = rt.retrying("sync.uids") {
             rt.withFolder(folder) { f ->
                 Checkpoints.uidValidity(validity, f.uidValidity)
-                f.search(MessageRange.All, MessageQuery.ALL).filter { it > lastSeen && it <= upper }.sorted()
+                f.search(MessageRange.All, query).filter { it > lastSeen && it <= upper }.sorted()
             }
         }
         // Incremental syncs proceed oldest-first so the checkpoint can advance; a first sync or reset
@@ -53,7 +58,7 @@ internal class ConversationsImpl(private val rt: MailboxRuntime, private val mes
             else -> upper
         }
         val context = if (fresh.isEmpty()) emptyList()
-        else window(folder, WINDOW, upperUid = fresh.minOf { it.location.uid } - 1).second
+        else window(folder, WINDOW, upperUid = fresh.minOf { it.location.uid } - 1, query = query).second
         val related = relatedTo(fresh, context + fresh)
         val freshLocations = fresh.map { it.location }.toSet()
         val changed = ConversationAssembler.assemble(related.toList())
@@ -66,10 +71,15 @@ internal class ConversationsImpl(private val rt: MailboxRuntime, private val mes
         ConversationCheckpoint(rt.key, folder.value, validity, lastUid)
 
     /** Envelopes of the newest [size] UIDs at or below [upperUid]; also returns the validity used. */
-    private suspend fun window(folder: FolderPath, size: Int, upperUid: Long?): Pair<Long, List<MessageEnvelope>> {
+    private suspend fun window(
+        folder: FolderPath,
+        size: Int,
+        upperUid: Long?,
+        query: MessageQuery = MessageQuery.ALL,
+    ): Pair<Long, List<MessageEnvelope>> {
         val (validity, uids) = rt.retrying("window") {
             rt.withFolder(folder) { f ->
-                f.uidValidity to f.search(MessageRange.All, MessageQuery.ALL).filter { upperUid == null || it <= upperUid }.sorted().takeLast(size)
+                f.uidValidity to f.search(MessageRange.All, query).filter { upperUid == null || it <= upperUid }.sorted().takeLast(size)
             }
         }
         return validity to uids.chunked(BATCH).flatMap { rt.fetchEnvelopes(folder, validity, it) }
@@ -83,7 +93,8 @@ internal class ConversationsImpl(private val rt: MailboxRuntime, private val mes
         }
 
     private companion object {
-        const val WINDOW = 2000
+        /** Older messages fetched purely to attach fresh ones to an existing thread. */
+        const val WINDOW = 500
         const val BATCH = 100
     }
 }
