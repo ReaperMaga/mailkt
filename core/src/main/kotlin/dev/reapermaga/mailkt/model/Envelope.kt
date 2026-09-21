@@ -50,8 +50,17 @@ data class MessageQuery(
 /** Membership of a historical scan; frozen when the scan starts. */
 sealed interface MessageRange {
     data object All : MessageRange
-    /** 1-based inclusive message positions, newest last. */
-    data class Positions(val first: Int, val last: Int) : MessageRange
+    /**
+     * 1-based inclusive message positions. By default these are IMAP sequence numbers, where 1 is
+     * the oldest message. With [fromNewest] they are counted from the end instead, so 1..100 is the
+     * hundred most recent messages regardless of how large the folder is.
+     */
+    data class Positions(val first: Int, val last: Int, val fromNewest: Boolean = false) : MessageRange {
+        init {
+            require(first >= 1) { "positions are 1-based" }
+            require(last >= first) { "last must not precede first" }
+        }
+    }
     data class Dates(val from: Instant?, val before: Instant?) : MessageRange
 }
 

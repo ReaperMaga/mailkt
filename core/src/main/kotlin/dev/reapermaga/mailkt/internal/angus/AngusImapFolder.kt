@@ -53,8 +53,11 @@ internal class AngusImapFolder(
             }
             is MessageRange.Positions -> {
                 val count = folder.messageCount
-                val last = minOf(range.last, count)
-                if (range.first > last) emptyArray<Message>() else folder.getMessages(range.first, last)
+                // Counting from the newest end resolves against the current count, so the same
+                // request keeps meaning "the most recent N" as the folder grows.
+                val first = if (range.fromNewest) maxOf(1, count - range.last + 1) else range.first
+                val last = if (range.fromNewest) count - range.first + 1 else minOf(range.last, count)
+                if (first > last || last < 1) emptyArray<Message>() else folder.getMessages(first, last)
             }
         }
         if (candidates.isEmpty()) return@io emptyList()
