@@ -11,7 +11,6 @@ internal object AngusProperties {
         setProperty("mail.imap.port", endpoint.imapPort.toString())
         setProperty("mail.imap.ssl.enable", "true")
         setProperty("mail.imap.ssl.checkserveridentity", "true")
-        setProperty("mail.imap.usesocketchannels", "true")
         setProperty("mail.imap.connectiontimeout", "15000")
         setProperty("mail.imap.timeout", "30000")
         setProperty("mail.imap.writetimeout", "30000")

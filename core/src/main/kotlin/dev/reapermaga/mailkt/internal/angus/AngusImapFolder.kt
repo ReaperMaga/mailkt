@@ -132,7 +132,7 @@ internal class AngusImapFolder(
         }
         folder.addMessageCountListener(listener)
         try {
-            if (idleSupported()) idle(timeoutMillis) else poll(timeoutMillis, changed)
+            if (idleSupported()) idle(timeoutMillis, changed) else poll(timeoutMillis, changed)
         } finally {
             runCatching { folder.removeMessageCountListener(listener) }
         }
@@ -141,8 +141,23 @@ internal class AngusImapFolder(
 
     private fun idleSupported(): Boolean = runCatching { (folder.store as org.eclipse.angus.mail.imap.IMAPStore).hasCapability("IDLE") }.getOrDefault(false)
 
-    /** IDLE until an event; any other command (NOOP) aborts it, which also serves timeout and cancellation. */
-    private suspend fun idle(timeoutMillis: Long) = coroutineScope {
+    /**
+     * IDLE until an event; any other command (NOOP) aborts it, which also serves timeout and
+     * cancellation.
+     *
+     * IDLE is re-issued in chunks shorter than the socket read timeout: a quiet mailbox would
+     * otherwise trip that timeout and look like a transport failure, forcing a needless reconnect.
+     */
+    private suspend fun idle(timeoutMillis: Long, changed: AtomicBoolean) {
+        val deadline = System.nanoTime() + timeoutMillis * 1_000_000
+        while (!changed.get()) {
+            val remaining = (deadline - System.nanoTime()) / 1_000_000
+            if (remaining <= 0) return
+            idleOnce(minOf(remaining, IDLE_CHUNK_MILLIS))
+        }
+    }
+
+    private suspend fun idleOnce(timeoutMillis: Long) = coroutineScope {
         val worker = launch(Dispatchers.IO) { folder.idle(true) }
         try {
             withTimeoutOrNull(timeoutMillis) { worker.join() }
@@ -166,5 +181,8 @@ internal class AngusImapFolder(
 
     private companion object {
         const val POLL_MILLIS = 5_000L
+
+        /** Below `mail.imap.timeout`, so a quiet IDLE never hits the socket read timeout. */
+        const val IDLE_CHUNK_MILLIS = 25_000L
     }
 }
