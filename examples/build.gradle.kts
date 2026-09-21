@@ -6,4 +6,5 @@ dependencies {
     implementation(project(":gmail"))
     implementation(libs.dotenv)
     runtimeOnly(libs.slf4jSimple)
+    testImplementation(kotlin("test"))
 }
