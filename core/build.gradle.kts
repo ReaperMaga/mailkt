@@ -4,7 +4,7 @@ plugins {
 
 dependencies {
     api(libs.kotlinxCoroutines)
-    api(libs.angusMail)
+    implementation(libs.angusMail)
     implementation(libs.kotlinxSerialization)
     implementation(libs.slf4jApi)
     testImplementation(kotlin("test"))

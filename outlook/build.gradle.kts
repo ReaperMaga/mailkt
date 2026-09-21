@@ -3,4 +3,5 @@ plugins { id("buildsrc.convention.kotlin-jvm") }
 dependencies {
     implementation(libs.msal4j)
     api(project(":core"))
+    testImplementation(kotlin("test"))
 }
