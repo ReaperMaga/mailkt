@@ -1,28 +1,35 @@
 # mailkt
 
-Coroutine-first Kotlin/JVM helpers for email over IMAP, with ready-to-use Outlook (Microsoft 365)
-and Gmail OAuth2 implementations.
+Coroutine-first Kotlin/JVM library for reading, watching and sending email through a managed
+`Mailbox`, with hosted OAuth2 for Gmail and Outlook (Microsoft 365). MailKT runs entirely in your
+backend process; it never opens a browser, starts an HTTP listener or persists anything itself.
 
 Highlights:
 
-- Suspending authentication, connection, folder, and lifecycle APIs.
-- Eclipse Angus Mail with secure TLS defaults and cancellable blocking calls.
-- Structured session management through `StateFlow` and `SharedFlow`.
-- Cold `Flow` mailbox notifications with automatic IMAP IDLE cleanup.
-- Atomic token-file writes and optional AES-GCM encryption.
+- One lifecycle handle per account: `Mailbox` with an explicit `StateFlow<MailboxState>`, automatic
+  generation-safe reconnects and idempotent `close()`.
+- Capability-oriented API: `mailbox.folders`, `mailbox.messages`, `mailbox.conversations`,
+  `mailbox.outbox`.
+- Envelope-first reading: filter on cheap metadata first, inspect MIME structure second, download
+  only the parts you need.
+- Immutable MailKT models. No Jakarta or Angus type appears in the public API.
+- Explicit send outcomes (`ACCEPTED`, `FAILED`, `UNKNOWN`), never retried automatically.
+- No built-in persistence: tokens, pending authorizations and checkpoints cross small interfaces or
+  return values that you store.
 
 ## Modules
 
-| Module      | Purpose                                                                   |
-|-------------|---------------------------------------------------------------------------|
-| `:core`     | Mail abstractions, session management, folders, and token persistence.    |
-| `:outlook`  | MSAL OAuth2 and IMAP access through `outlook.office365.com`.              |
-| `:gmail`    | Google installed-app OAuth2 and IMAP access through `imap.gmail.com`.     |
-| `:examples` | Runnable coroutine-first provider and lifecycle examples.                 |
+| Module      | Purpose                                                                       |
+|-------------|-------------------------------------------------------------------------------|
+| `:core`     | `Mailbox`, models, capabilities, lifecycle, IMAP/SMTP transport, MIME.        |
+| `:gmail`    | Hosted Google authorization-code flow and `imap.gmail.com` / `smtp.gmail.com`. |
+| `:outlook`  | Hosted Microsoft (MSAL4J) flow and `outlook.office365.com` IMAP/SMTP.         |
+| `:examples` | Compile-tested sources of every snippet in this document.                     |
 
 ## Requirements
 
-- JDK 21
+- JDK 25
+- SLF4J 2 is used as an API only; add the logging backend of your choice.
 
 ## Installation
 
@@ -37,353 +44,517 @@ repositories {
 
 dependencies {
     implementation("dev.reapermaga.mailkt:core:0.1.0")
-    implementation("dev.reapermaga.mailkt:outlook:0.1.0")
     implementation("dev.reapermaga.mailkt:gmail:0.1.0")
+    implementation("dev.reapermaga.mailkt:outlook:0.1.0")
 }
 ```
 
-## Outlook
+Every snippet below is copied verbatim from the `examples` module, which is compiled and checked
+against this document by a test, so the documentation cannot drift from the API.
 
-The public API uses suspending functions, so a command-line entry point can itself be `suspend`:
+## Persistence boundary
+
+MailKT ships no file, database, cache, encryption or secret-store implementation. You implement two
+narrow suspending interfaces and inject them:
 
 ```kotlin
-suspend fun main() {
-    val oauth = OutlookOAuth2MailAuth(
-        OutlookOAuth2Config.consumer(clientId),
-        FileTokenPersistenceStorage(username),
+interface TokenStore {
+    suspend fun load(key: TokenKey): ByteArray?
+    suspend fun save(key: TokenKey, value: ByteArray)
+    suspend fun delete(key: TokenKey)
+}
+
+interface AuthorizationSessionStore {
+    suspend fun save(session: PendingAuthorization)
+    suspend fun consume(state: String): PendingAuthorization?
+}
+```
+
+- `TokenKey` contains the provider, the client registration and the `MailboxId`, so tokens of
+  different providers or mailboxes can never overwrite each other. Values are opaque bytes owned by
+  the provider adapters.
+- `TokenStore` implementations must replace values atomically and isolate concurrent access.
+  Encryption, key management, retention, backup and deletion are the application's responsibility.
+- `AuthorizationSessionStore.consume` must be atomic and one-time; pending sessions hold sensitive
+  state and PKCE material and expire after ten minutes. A shared store supports several backend
+  instances and prevents replay.
+- Checkpoints (`ScanCheckpoint`, `WatchCheckpoint`, `ConversationCheckpoint`) are immutable values of
+  primitives plus a format version. Operations accept a previous checkpoint and return the next one;
+  MailKT never saves or acknowledges them. Persist a checkpoint only when your processing is durable.
+
+Demonstration implementations (not for production):
+
+```kotlin
+/** Demonstration only. A real store persists opaque bytes durably, encrypted, with atomic replacement. */
+class InMemoryTokenStore : TokenStore {
+    private val values = ConcurrentHashMap<String, ByteArray>()
+
+    override suspend fun load(key: TokenKey): ByteArray? = values[key.storageKey]?.copyOf()
+
+    override suspend fun save(key: TokenKey, value: ByteArray) {
+        values[key.storageKey] = value.copyOf()
+    }
+
+    override suspend fun delete(key: TokenKey) {
+        values.remove(key.storageKey)
+    }
+}
+```
+
+```kotlin
+/** Demonstration only. A shared backend needs a store whose `consume` is atomic across instances. */
+class InMemoryAuthorizationSessionStore : AuthorizationSessionStore {
+    private val pending = ConcurrentHashMap<String, PendingAuthorization>()
+
+    override suspend fun save(session: PendingAuthorization) {
+        pending[session.state] = session
+    }
+
+    override suspend fun consume(state: String): PendingAuthorization? = pending.remove(state)
+}
+```
+
+## Hosted authorization for Gmail and Outlook
+
+Both providers use the same split frontend/backend authorization-code flow:
+
+1. The backend calls `beginAuthorization` and returns the generated URL to the frontend, which
+   performs the browser redirect.
+2. The provider redirects the browser to a backend callback route that you register with the
+   provider (HTTPS in production, provider-supported HTTP loopback such as
+   `http://localhost:8080/oauth/{provider}/callback` for local development). MailKT never registers
+   the route.
+3. The backend converts the query parameters into an `AuthorizationCallback` and calls
+   `completeAuthorization`. MailKT validates the one-time state, expiry, redirect URI, provider
+   response and PKCE verifier, verifies that the authenticated account matches the requested
+   mailbox, and only then stores the tokens.
+4. `open` builds the mailbox from the stored tokens using silent refresh only.
+
+Provider configuration holds an explicit allowlist of redirect URIs; `beginAuthorization` rejects
+anything else, so an arbitrary redirect URI from the frontend is never trusted. The expected email is
+the mailbox's user-facing identity; MailKT derives the `MailboxId` from the provider identity and the
+provider-canonical authenticated email, so the same address on different providers never collides.
+To switch accounts, open a different email explicitly.
+
+### Gmail
+
+Create Google **Web application** OAuth credentials and register the exact callback URIs.
+
+```kotlin
+fun gmailClient(tokens: InMemoryTokenStore, sessions: InMemoryAuthorizationSessionStore): Gmail {
+    val config = GmailConfig(
+        clientId = System.getenv("GMAIL_CLIENT_ID"),
+        clientSecret = System.getenv("GMAIL_CLIENT_SECRET"),
+        // Exact backend callback URIs registered with Google for this environment.
+        allowedRedirectUris = setOf(
+            URI("https://app.example.com/oauth/gmail/callback"),
+            URI("http://localhost:8080/oauth/gmail/callback"), // local development
+        ),
     )
-    val credentials = if (oauth.hasToken()) {
-        oauth.login()
-    } else {
-        oauth.deviceLogin {
-            println("Open ${it.verificationUri} and enter code ${it.code}")
+    return Gmail(config, tokens, sessions)
+}
+```
+
+```kotlin
+/** Backend endpoint: returns the URL the frontend navigates the browser to. */
+suspend fun beginGmailAuthorization(gmail: Gmail, email: String): String {
+    val request = gmail.beginAuthorization(
+        expectedEmail = MailAddress(email),
+        redirectUri = URI("https://app.example.com/oauth/gmail/callback"),
+    )
+    return request.authorizationUrl.toString()
+}
+```
+
+```kotlin
+/** Backend route registered as the redirect URI: hand the query parameters to MailKT. */
+suspend fun gmailCallback(gmail: Gmail, code: String?, state: String?, error: String?): Mailbox {
+    val id = gmail.completeAuthorization(AuthorizationCallback(code, state, error))
+    println("Authorized mailbox of provider ${id.provider}")
+    return gmail.open(MailAddress(requireNotNull(System.getenv("GMAIL_ADDRESS"))), MailboxOptions())
+}
+```
+
+### Outlook
+
+Register a web/confidential client in Microsoft Entra with a client secret held by the backend. The
+IMAP delegated scope is requested together with `offline_access`; set `enableSending` to add the
+SMTP scope.
+
+```kotlin
+fun outlookClient(tokens: InMemoryTokenStore, sessions: InMemoryAuthorizationSessionStore): Outlook {
+    val config = OutlookConfig(
+        clientId = System.getenv("OUTLOOK_CLIENT_ID"),
+        clientSecret = System.getenv("OUTLOOK_CLIENT_SECRET"), // held by the backend only
+        allowedRedirectUris = setOf(URI("https://app.example.com/oauth/outlook/callback")),
+        enableSending = true, // adds the SMTP.Send scope
+    )
+    return Outlook(config, tokens, sessions)
+}
+```
+
+```kotlin
+suspend fun outlookAuthorizeAndOpen(outlook: Outlook, email: String, code: String, state: String): Mailbox {
+    // 1. The backend creates the browser URL for the frontend.
+    val request = outlook.beginAuthorization(MailAddress(email), URI("https://app.example.com/oauth/outlook/callback"))
+    println("Send the browser to ${request.authorizationUrl}")
+    // 2. The provider redirects to the backend callback, which completes the flow.
+    outlook.completeAuthorization(AuthorizationCallback(code = code, state = state))
+    // 3. Open the mailbox using the stored tokens.
+    return outlook.open(MailAddress(email))
+}
+```
+
+## Mailbox lifecycle
+
+`Mailbox` is the single lifecycle handle. Opening suspends until the first authenticated connection
+succeeds; failures are typed `MailException`s and no partially initialized mailbox is exposed.
+
+```kotlin
+suspend fun openWithPolicy(gmail: Gmail, registry: MailboxRegistry): Mailbox {
+    val options = MailboxOptions(
+        connectionPolicy = ConnectionPolicy(keepAliveInterval = 30.seconds, maxReconnectAttempts = 5),
+        registry = registry, // optional: rejects a second open mailbox with the same identity
+    )
+    return gmail.open(MailAddress("alice@gmail.com"), options)
+}
+```
+
+`state` is the authoritative snapshot; `events` is a bounded best-effort diagnostic stream.
+
+| State                      | Meaning                                                              |
+|----------------------------|----------------------------------------------------------------------|
+| `Connected`                | Operations run on the current connection generation.                 |
+| `Reconnecting`             | Automatic recovery after a network, socket, TLS or store failure.     |
+| `AuthenticationRequired`   | Silent refresh failed; run the hosted flow, then call `reconnect()`. |
+| `Failed(recoverable)`      | Attempts exhausted; idle until `reconnect()` or `close()`.            |
+| `Closed`                   | Terminal; published exactly once.                                    |
+
+```kotlin
+fun observeState(mailbox: Mailbox, scope: CoroutineScope) {
+    mailbox.state.onEach { state ->
+        when (state) {
+            MailboxState.Connected -> println("Connected")
+            is MailboxState.Reconnecting -> println("Reconnecting, attempt ${state.attempt} (${state.reason})")
+            MailboxState.AuthenticationRequired -> println("Run the authorization flow again, then call reconnect()")
+            is MailboxState.Failed -> println("Failed (recoverable=${state.recoverable}); call reconnect() to retry")
+            MailboxState.Closed -> println("Closed")
         }
-    }
+    }.launchIn(scope)
+}
+```
 
-    val session = OutlookMailSession()
-    try {
-        session.connect(
-            MailCredentials.oauth2(credentials.username, credentials.accessToken)
-        )
+Recovery follows `ConnectionPolicy` (30 second keep-alive and attempt timeout, five attempts,
+exponential backoff from one to 30 seconds with 20 percent jitter). Concurrent failures of one
+generation coalesce into one reconnect, a replacement connection is authenticated before it is
+published, and the old one is closed once. Operations pin the generation they started on; reads
+resume or restart depending on their contract, and SMTP submission and your own consumer code are
+never retried. MailKT never navigates a browser on its own:
 
-        val inbox = readMessages(session, "INBOX")
+```kotlin
+/** After the application completed a new hosted authorization, resume the same mailbox. */
+suspend fun resumeAfterReauthorization(mailbox: Mailbox) {
+    if (mailbox.state.value is MailboxState.AuthenticationRequired || mailbox.state.value is MailboxState.Failed) {
         try {
-            println("Loaded ${inbox.messages.size} recent messages")
-        } finally {
-            inbox.close()
+            mailbox.reconnect()
+        } catch (e: MailException.AuthenticationRequired) {
+            println("Still not authorized; send the user through the authorization flow again")
         }
-    } finally {
-        session.disconnect()
     }
 }
 ```
 
-## Gmail
-
-Create a Google OAuth client with the Desktop app application type. First-time login opens a
-browser and receives Google's redirect through a temporary loopback server; later calls refresh the
-persisted credential.
+`close()` is suspending and idempotent; it rejects new operations, cancels watchers and background
+work and releases every folder, IDLE watcher and connection. `use` closes a mailbox around a scope:
 
 ```kotlin
-val oauth = GmailOAuth2MailAuth(
-    GmailOAuth2Config.installedApp(clientId, clientSecret),
-    FileTokenPersistenceStorage("gmail"),
-)
-val credentials = oauth.login()
-
-val session = GmailMailSession()
-session.connect(MailCredentials.oauth2(credentials.username, credentials.accessToken))
-```
-
-Gmail IMAP access requires the `https://mail.google.com/` OAuth scope. Public applications using
-this scope may need to complete Google's app verification process.
-
-## Watching a folder
-
-Folder notifications are a cold `Flow`. Cancelling collection unregisters the listener and stops
-IMAP IDLE automatically. Messages are eagerly detached before emission, so MIME bodies and
-attachments remain readable while downstream processing suspends or after the source folder closes.
-
-```kotlin
-watchFolder(session, "INBOX").collect { message ->
-    println("New message: ${message.subject}")
+suspend fun withMailbox(gmail: Gmail) {
+    gmail.open(MailAddress("alice@gmail.com")).use { mailbox ->
+        println("Connected as mailbox of ${mailbox.id.provider}")
+    } // always closed, even on failure or cancellation
 }
 ```
 
-When the session is owned by `MailSessionManager`, pass the managed handle to follow reconnects:
+### Multiple mailboxes
+
+Every `Mailbox` owns its connection, state machine, recovery loop, watchers and cursors. There is no
+global session manager: keep your own `Map<MailboxId, Mailbox>` or use the optional
+`MailboxRegistry`, which only enforces identity uniqueness and closes all mailboxes concurrently.
+The same `TokenStore`, configuration and dispatchers may be shared safely.
 
 ```kotlin
-watchFolder(managedSession, "INBOX").collect { message ->
-    processMessage(message)
+suspend fun shutdown(registry: MailboxRegistry) {
+    val report = registry.close() // closes all mailboxes concurrently
+    report.failures.forEach { (id, _) -> println("Failed to close mailbox of ${id.provider}") }
 }
 ```
 
-The managed overload closes each obsolete folder/IDLE generation and reopens against the latest
-connection. IMAP UID catch-up provides at-least-once delivery across reconnects and suppresses
-duplicates within one collector where possible. Consumers with persistent side effects should
-still de-duplicate by account/folder/`Message-ID`. The source-compatible `MailSession`
-overload cannot observe store replacement and instead fails with a recoverable
-`FolderWatchException` when its folder or store closes. A UIDVALIDITY change triggers a full folder
-catch-up, deliberately preferring duplicate notifications over message loss.
-
-## Streaming historical scans
-
-Use `readMessagesFlow` with a `ManagedMailSession` for invoice scans or other historical reads.
-The existing `readMessages(MailSession, ...)` API still returns live folder-backed messages and
-requires closing its result.
+## Folders
 
 ```kotlin
-// Before: a list of live messages; the caller owns the folder lifetime.
-val batch = readMessages(managed.session, "INBOX", 1..1000)
-try {
-    batch.messages.forEach { processMessage(it) }
-} finally {
-    batch.close()
+suspend fun discoverFolders(mailbox: Mailbox): FolderPath {
+    mailbox.folders.list().forEach { println("${it.name} special=${it.specialUse}") }
+    val sent = mailbox.folders.special(SpecialUse.SENT)
+    println("Sent folder resolved: ${sent != null}")
+    return checkNotNull(mailbox.folders.special(SpecialUse.INBOX)).path
 }
-
-// After: each body and attachment is fully downloaded before delivery.
-readMessagesFlow(managed, "INBOX", 1..1000).collect { item ->
-    processMessage(item.message)
-    // item.uid, item.uidValidity, item.receivedAt are server metadata.
-}
-
-// Inclusive server received dates; newest mailbox position first.
-readMessagesFlow(
-    managed,
-    "INBOX",
-    LocalDate.of(2026, 9, 1)..LocalDate.of(2026, 9, 14),
-    HistoricalReadOptions(
-        downloadTimeout = 30.seconds,
-        recoveryTimeout = 120.seconds,
-        maxRecoveryAttempts = 5,
-        maxMessageBytes = 25L * 1024 * 1024,
-    ),
-).collect { item -> processMessage(item.message) }
 ```
 
-Each collection fixes range membership as an ordered UID/UIDVALIDITY snapshot before downloading
-bodies. UIDs are prefetched with `UIDFolder.FetchProfileItem.UID` in batches of at most 500 selected
-messages before per-message UID access. Selection runs once, preserving newest-first order for
-both position and date ranges. New arrivals cannot shift it during retries. Expunged requested
-messages, changed UIDVALIDITY, and missing/nonpersistent UID support fail explicitly. If initial range resolution
-is interrupted, the scan fails with `operation=resolve-range`; it cannot safely reconstruct a
-position range whose original membership was never established.
+## Reading mail: envelope, structure, part
 
-A recoverable folder/store/socket failure during range resolution requests replacement of the
-failed connection generation, even if the store still reports connected. Concurrent requests
-coalesce and stale generations are ignored. The current scan still fails before emitting any
-messages; neither position nor date selection is automatically retried. Subsequent operations can
-use the recovered connection. Locally owned snapshot deadlines also request recovery and appear
-as a `java.util.concurrent.TimeoutException` cause of `HistoricalReadException`. Parent cancellation
-and caller-owned deadlines propagate directly without requesting recovery.
+Reading is a pipeline; each stage is optional and later stages only run for survivors of earlier ones.
 
-Angus 2.0.5 can convert an I/O error into a synthetic BYE response, then construct
-`FolderClosedException` with only the response text. A TLS exception can therefore be absent from
-the cause chain. Recovery uses the folder/store exception types, never message-text matching.
-This handles the closed connection; it does not establish or fix the underlying TLS failure.
+- `MessageEnvelope`: location, UID and UIDVALIDITY, Message-ID relations, addresses, subject, dates,
+  flags, content type, advertised size. No body, no attachment bytes.
+- `MessageStructure`: a tree of `MessagePartDescriptor`s (media type, disposition, file name,
+  content ID, transfer encoding, advertised size, stable `MessagePartRef`). No bytes.
+- `MailMessage`: the decoded immutable content tree and attachments plus the envelope.
+- `MessageQuery` contains only predicates evaluable from an envelope: folder, dates, addresses,
+  flags, subject, headers, thread IDs, size. Filtering on body or attachment content is necessarily
+  after download.
 
-Downloads resume at the interrupted UID. Recoverable nested folder/store/socket errors are retried
-against a usable managed connection. Store/socket failures and download timeouts request replacement
-of the failed connection generation, even when the store still reports connected. Folder closures
-allow two reopen retries on that generation before requesting replacement. Concurrent requests
-coalesce; late requests for replaced generations are ignored. Each message has
-its own download timeout and recovery budget (including waiting for a connection); successfully
-progressing scans have no overall deadline. `maxRecoveryAttempts` counts retries after the initial
-attempt. As with other cancellable blocking mail operations, prompt interruption depends on the
-provider; configure finite IMAP socket read/connect timeouts for transports that ignore interrupts.
+A `MessagePartRef` carries the mailbox, folder, UIDVALIDITY, UID and MIME section and only works with
+its originating mailbox. Part downloads require an explicit byte limit and return detached MailKT
+content. If a message is expunged, UIDVALIDITY changes or a part changes between selection and
+download, you get a typed `MessageUnavailable` or `IntegrityViolation`; another message or part is
+never substituted.
 
-A successful collection delivers each selected UID once. Retrying a download never retries consumer
-code. Emissions happen outside recovery and state-switching jobs, so suspended consumers and caller
-buffers retain readable detached messages across reconnects. Cancellation or a consumer failure
-ends the scan; it is not a durable acknowledgement protocol. Starting a new collection scans anew.
-For durable processing, persist `(account, folder, uidValidity, uid)` after successful processing.
-The received timestamp is in `item.receivedAt`; MIME headers alone cannot preserve IMAP INTERNALDATE.
+### Paging
 
-The default flow has no body prefetch or output buffer and opens/closes a folder per snapshot/download attempt.
-It retains O(selected UIDs) metadata and one message body at a time. Serialization/parsing may need
-several copies of that body; the size cap limits serialized MIME bytes, including unknown-size
-messages, rather than total heap usage or later decoded attachments. Adding `.buffer(n)` adds up
-to `n` queued detached copies plus an in-flight message. No executors or listener jobs are created.
-`HistoricalReadException` exposes `operation`, `uid`, `attempt`, and the original cause; recovery
-deadline failures also preserve the last transport failure. The reader logs no message contents or
-credentials. Diagnostics include operation, UID, attempt, elapsed time, connection generation,
-recovery reason and outcome; exception text from providers is not written to lifecycle logs.
-
-Each managed mailbox has an independent health-check loop. A locally owned health-check/reconnect
-deadline is reported as a recoverable `java.util.concurrent.TimeoutException` through
-`ReconnectFailed` and the manager's exception handler. It counts toward `maxReconnectAttempts`.
-Parent cancellation still propagates. A later successful health check restores `Connected`, and
-failed reconnects keep requesting replacement until success or exhaustion. The connection provider
-must establish and return a usable connection when called, including when the previous store still
-reports connected; the built-in Outlook/Gmail `connect` implementations already replace the store.
-
-No consumer API changes are required: continue sharing the same managed handle between
-`watchFolder(managed, "INBOX")` and `readMessagesFlow(managed, "INBOX", range)`. Recovery coordination
-is internal. Keep sender checks, PDF/AI processing, and other consumer work inside `collect`; those
-operations remain outside the reader's download/recovery budgets. Timeout defaults are unchanged.
-
-## Conversation APIs
-
-These extensions stay independent of companies, invoice parsing, persistence, AI, and application
-authorization. Existing reading/watching APIs are unchanged. All examples below use the same
-`ManagedMailSession` returned by your session manager; no second credential store is needed.
+Pages freeze their membership: later arrivals never shift a resumed scan. A sparse or heavily
+filtered page can be empty and still carry a continuation checkpoint.
 
 ```kotlin
-import dev.reapermaga.mailkt.message.*
-import dev.reapermaga.mailkt.folder.*
-
-val draft = composeMessage(
-    from = "me@example.com",
-    to = listOf("contact@example.com"),
-    subject = "Invoice question",
-    text = "Please resend the invoice with the correct billing address.",
-)
-// Persist the draft, its Message-ID, and an UNKNOWN attempt state before submission.
-val result = managed.sendMessage(draft)
-when (result.status) {
-    SendStatus.ACCEPTED -> { /* Persist outgoing history; service accepted, delivery unconfirmed. */ }
-    SendStatus.FAILED -> { /* Preserve draft; show failure. */ }
-    SendStatus.UNKNOWN -> { /* Reconcile by Message-ID; do not automatically retry. */ }
+suspend fun pageThroughInbox(mailbox: Mailbox, inbox: FolderPath): Int {
+    var checkpoint: ScanCheckpoint? = null
+    var seen = 0
+    do {
+        val page = mailbox.messages.page(
+            MessageSelection(inbox, newestFirst = true, checkpoint = checkpoint),
+            limit = 50,
+        )
+        seen += page.envelopes.size // a sparse page can be empty and still continue
+        checkpoint = page.next // persist this only after the page is durably processed
+    } while (checkpoint != null)
+    return seen
 }
-
-val reply = composeReply(originalMessage, "me@example.com", "Thank you", replyAll = false)
-// Review recipients before calling managed.sendMessage(reply).
-
-val filter = MessageFilter(
-    addresses = setOf("contact@example.com"),
-    threadMessageIds = setOf("<known-thread-message@example.com>"),
-)
-var page = readMessagePage(managed, "INBOX", filter)
-// Persist/process page.messages. Load older pages on demand:
-while (page.nextCursor != null) {
-    page = readMessagePage(managed, "INBOX", filter, cursor = page.nextCursor)
-}
-// After processing ALL pages, checkpoint page.uidValidity and page.snapshotUpperUid.
-val arrivals = readMessagePage(
-    managed, "INBOX", filter,
-    afterUid = page.snapshotUpperUid,
-    expectedUidValidity = page.uidValidity,
-)
-// Also drain arrivals.nextCursor before advancing the checkpoint.
 ```
 
-`composeMessage` supports To/Cc/Bcc, UTF-8 subject/text and generates a Message-ID. `composeReply`
-respects Reply-To and builds In-Reply-To/References; reply-all removes the sending mailbox and Bcc.
-Messages remain Jakarta `MimeMessage` objects, so MIME bodies and attachments can also be composed
-through Jakarta APIs. Do not mutate a draft during submission. Sending finalizes MIME headers
-without changing its existing Message-ID. Message-ID is a reconciliation key, not an SMTP
-idempotency guarantee. Cancellation or a process crash can leave submission unknown; no send
-operation retries automatically. Prevent concurrent duplicate submissions in your backend.
-
-### Assembled conversation history
+### Historical streaming
 
 ```kotlin
-val history = readConversations(
-    session = managed,
-    folderNames = listOf("INBOX", sentFolderName),
-    contacts = setOf("contact@example.com"),
-)
-// history.threads contains separate email threads with chronological messages.
-// Each message exposes its MIME content, timestamp, unread state and all mailbox copies/locations.
-val older = readConversations(
-    managed, listOf("INBOX", sentFolderName), setOf("contact@example.com"),
-    threadMessageIds = history.threads.flatMap { it.relatedMessageIds }.toSet(),
-    options = ConversationReadOptions(beforeUidByFolder = history.folders.associate {
-        it.folderName to it.lowerUid
-    }),
-)
-val combinedThreads = assembleConversations(
-    (history.threads + older.threads).flatMap { it.messages }.flatMap { it.copies },
-)
+suspend fun streamHistory(mailbox: Mailbox, inbox: FolderPath, since: Instant) {
+    val selection = MessageSelection(inbox, range = MessageRange.Dates(from = since, before = null))
+    mailbox.messages.envelopes(selection).collect { envelope ->
+        println("UID ${envelope.location.uid} size=${envelope.advertisedSize}")
+    }
+}
 ```
 
-`readConversations` indexes only envelopes and threading headers for up to 2,000 recent UID
-positions per folder by default, then follows the transitive Message-ID/References/In-Reply-To
-relationships in that window, including ancestors and replies whose participants changed.
-It downloads only selected bodies, with defaults of 500 matching mailbox copies and 50 MiB total
-serialized MIME. Limits fail explicitly rather than returning silently incomplete threads.
-Include archive/custom folders if your application needs their history. Missing ancestors or
-stripped threading headers cannot be reconstructed by subject or shared domain.
+### Selective download
 
-Folder snapshots expose `olderHistoryAvailable` and `lowerUid` for progressive loading with
-`beforeUidByFolder`. Replies outside a requested window are not included; expand the window or
-load more history. Pass known message IDs when loading older pages, and reassemble stored copies
-with new reads. For incremental updates, call `readMessagePage` with contacts plus all known thread
-IDs, retain folder locations, then call `assembleConversations` with stored and new copies. Older
-previously excluded messages may need a new bounded conversation read when a new reply establishes
-a relationship. Truncated conversation snapshots must not be treated as full-mailbox sync checkpoints.
+The same pipeline serves historical scans and live arrivals, and MailKT needs to know nothing about
+your rules. Sender or subject rejection performs no structure or content fetch; file name or type
+rejection performs no attachment download.
 
-`assembleConversations` retains mailbox location/flag information and conservatively merges copies
-with the same Message-ID only if sender, To/Cc, subject, timestamp, reply headers, MIME type and body
-hash agree. Missing IDs remain separate, and conflicting same-ID content is retained. Accounts
-remain isolated; thread IDs are derived from known relationships and may change as older ancestors
-are discovered. Repeated locations use the last supplied copy, allowing flag updates from fresh reads.
-Neither function applies company ownership or renders/sanitizes HTML.
-
-Gmail and Outlook sessions configure SMTP with mandatory STARTTLS on port 587. Submission uses
-the current connected session's credentials and serializes with reconnect/disconnect. Each send
-opens/closes an SMTP transport underneath: IMAP itself cannot send mail. A disconnected account
-fails before submission. `MailSession.supportsSending` reports configured SMTP support, not
-granted consent or provider policy. The From address must equal the authenticated username;
-delegated Send As/alias sending is not supported. Custom `ImapMailSession` instances may opt in
-with `smtpConfig = SmtpConfig("smtp.example.com")`.
-
-For Outlook use `OutlookOAuth2Config.consumer(clientId, enableSending = true)` or add
-`https://outlook.office.com/SMTP.Send` to custom scopes. Existing read-only grants need new consent;
-refreshing an old token alone does not grant sending rights. Microsoft 365 may also require an
-administrator to enable authenticated SMTP for the mailbox. See
-[Microsoft OAuth protocol requirements](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth).
-Gmail's existing `https://mail.google.com/` scope covers IMAP and SMTP; see
-[Google XOAUTH2 documentation](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol).
-Connection success over IMAP does not prove SMTP authorization; surface authentication failures
-and reconnect with the additional consent when needed.
-
-`listMailFolders(managed.session)` returns names and IMAP SPECIAL-USE attributes such as `\\Sent`.
-Choose the provider's Sent folder and call `readMessagePage` on it as well as INBOX. Some servers
-omit SPECIAL-USE; let callers configure the folder instead of assuming an English name. SMTP
-does not universally save Sent copies. Persist accepted outgoing messages in the application;
-optionally use `appendSentMessage(managed, sentFolderName, draft)` for servers that do not save
-them. Do not append when the provider already saves a copy, and never resend because append failed.
-
-Each page examines at most 100 UID positions by default (configurable 1–500), newest-first for
-history and oldest-first for incremental reads. Address matching checks full From/To/Cc/Bcc
-addresses case-insensitively; it never matches a shared domain or subject. Explicit Message-ID,
-In-Reply-To and References tokens are alternatives to address matching. Expanding thread membership
-requires the caller to collect discovered IDs and perform a new filtered scan where necessary.
-Filtering reads envelopes/selected headers within the bounded UID window before downloading matching
-bodies. It is not a provider conversation index or a global server SEARCH. Sparse or filtered pages
-can be empty with a next cursor. Keep the same filter throughout a scan; new arrivals are outside
-its fixed snapshot. Cursors are scoped by session ID and folder: use a stable account ID across
-restarts, and validate cursor input in your backend. UIDVALIDITY changes require resynchronization.
-Expunged messages absent before selection are skipped. Reads fail explicitly on connection/provider
-errors; retry the same cursor after reconnect instead of advancing the checkpoint.
-
-Pages return detached `HistoricalMessage` MIME copies with UID, UIDVALIDITY, server received time,
-and copied flags, so content remains accessible after folders close. Defaults cap each message at
-25 MiB and the total serialized page at 50 MiB; decrease `uidWindowSize` if a page hits the cap.
-Decoded MIME and temporary copies require additional heap. Deduplicate folder items by
-`(account, folder, uidValidity, uid)` and reconcile sent copies by account/Message-ID where available.
-Handle missing/colliding Message-IDs explicitly. Persist checkpoints only after downstream work
-succeeds. Existing managed watchers can notify new arrivals; use page UIDs for durable catch-up.
-
-Company contact ambiguity, access checks, safe HTML rendering, tracking-image blocking, quoted-text
-collapsing, drafts and AI belong in Rechnungsradar. A contact filter is not authorization; never
-expose unfiltered mailbox access to company-scoped users. These APIs log no message bodies or tokens;
-avoid logging provider exception contents without redaction.
-
-This working tree extends the existing `ReaperMaga/mailkt` repository on `main`; no remote fork or
-release has been created. To consume a local development version:
-
-```powershell
-./gradlew.bat :core:publishToMavenLocal :gmail:publishToMavenLocal :outlook:publishToMavenLocal -Pbuild.version=0.1.1-conversations-SNAPSHOT
+```kotlin
+/** Envelope, then structure, then only the surviving parts: rejected mail costs no content download. */
+suspend fun ingestInvoices(mailbox: Mailbox, inbox: FolderPath, senders: Set<String>): List<ByteArray> {
+    val pdfs = mutableListOf<ByteArray>()
+    val selection = MessageSelection(inbox, MessageQuery(from = senders.map { MailAddress(it) }.toSet()))
+    mailbox.messages.envelopes(selection).collect { envelope ->
+        val structure = mailbox.messages.structure(envelope.location)
+        structure.attachments
+            .filter { it.isPdf && it.fileName?.startsWith("invoice", ignoreCase = true) == true }
+            .forEach { part ->
+                pdfs += mailbox.messages.download(part.ref, maxBytes = 10L * 1024 * 1024).content.toByteArray()
+            }
+    }
+    return pdfs
+}
 ```
 
-Add `mavenLocal()` to the consuming project's repositories and depend on
-`dev.reapermaga.mailkt:core:0.1.1-conversations-SNAPSHOT` and the corresponding provider module.
-Rechnungsradar is not present in this workspace; its integration and real-account send/reply
-verification must be performed there. Library tests exercise protocol configuration, submission
-outcomes, reply relationships, exact matching, bounded paging, cursor validity and detached content
-without accessing real mailboxes.
+For simple cases, full-message streams filter envelopes internally before fetching content:
+
+```kotlin
+suspend fun readFullMessages(mailbox: Mailbox, inbox: FolderPath) {
+    mailbox.messages.messages(MessageSelection(inbox, MessageQuery(seen = false))).collect { message ->
+        println("Unread message with ${message.attachments.size} attachments; text length ${message.plainText?.length ?: 0}")
+    }
+}
+```
+
+## Watching
+
+Watchers fetch and filter the envelope of every live IDLE notification before requesting anything
+else. They catch up from a `WatchCheckpoint` after restarts and reconnects, suppress duplicates within
+a collection and deliver at-least-once, so de-duplicate side effects by account and Message-ID. If
+UIDVALIDITY changed, the folder is rescanned rather than risking loss.
+
+```kotlin
+/** Live arrivals (IMAP IDLE) with catch-up. Delivery is at-least-once: de-duplicate by Message-ID. */
+suspend fun watchInbox(mailbox: Mailbox, inbox: FolderPath, saved: WatchCheckpoint?) {
+    val query = MessageQuery(from = setOf(MailAddress("billing@example.com")))
+    mailbox.messages.watchEnvelopes(inbox, query, from = saved).collect { watched ->
+        println("New mail UID ${watched.envelope.location.uid}")
+        // Persist watched.next only once your processing of this envelope is durable.
+    }
+}
+```
+
+```kotlin
+suspend fun watchFullMessages(mailbox: Mailbox, inbox: FolderPath) {
+    mailbox.messages.watch(inbox).collect { watched ->
+        println("Received ${watched.message.attachments.size} attachments")
+    }
+}
+```
+
+## Conversations
+
+Conversations are grouped by explicit relationships only (Message-ID, In-Reply-To, References),
+never by subject or domain. Copies of one message in several folders merge, and messages without an
+ID stay separate. `Conversations` works on envelopes; fetch bodies with `messages.get` when needed.
+`synchronize` is incremental per folder, reports UIDVALIDITY resets and marks truncated results, so
+call it again with the returned checkpoint until nothing is truncated.
+
+```kotlin
+suspend fun syncConversations(mailbox: Mailbox, inbox: FolderPath, saved: ConversationCheckpoint?): ConversationCheckpoint {
+    val sync = mailbox.conversations.synchronize(inbox, from = saved)
+    if (sync.reset) println("UIDVALIDITY changed: discard cached conversations")
+    sync.changed.forEach { println("Conversation with ${it.messages.size} messages, truncated=${it.truncated}") }
+    return sync.next // persist after applying `changed`
+}
+```
+
+```kotlin
+suspend fun readConversation(mailbox: Mailbox, location: MessageLocation) {
+    val conversation = mailbox.conversations.of(location, maxMessages = 100)
+    conversation.messages.forEach { println("Message ${it.location.uid}") }
+    // Fetch bodies only for the messages you need:
+    val newest = conversation.messages.last()
+    val full = mailbox.messages.get(newest.location)
+    println("Newest has ${full.attachments.size} attachments")
+}
+```
+
+## Composing and sending
+
+`outbox` is null when no SMTP endpoint is configured. Drafts are immutable; the Message-ID is
+assigned when the draft is created, so you can persist it before submission.
+
+```kotlin
+suspend fun composeAndSend(mailbox: Mailbox, pdf: ByteArray): SendResult {
+    val outbox = mailbox.outbox ?: error("This mailbox has no SMTP configured")
+    val draft = outbox.newDraft().copy(
+        to = listOf(MailParticipant(MailAddress("customer@example.com"), "Customer")),
+        subject = "Your invoice",
+        text = "Please find the invoice attached.",
+        attachments = listOf(MailAttachment("invoice.pdf", "application/pdf", ByteContent(pdf))),
+    )
+    // draft.messageId is assigned already: persist it BEFORE sending to reconcile an UNKNOWN outcome.
+    return outbox.send(draft)
+}
+```
+
+Replies derive recipients, subject and threading headers from an envelope. Reply-To is respected,
+reply-all excludes your own address, and Bcc is never exposed:
+
+```kotlin
+suspend fun replyToMessage(mailbox: Mailbox, original: MessageEnvelope): SendResult {
+    val outbox = checkNotNull(mailbox.outbox)
+    val reply = outbox.reply(original, replyAll = false, text = "Thank you, received.")
+    return outbox.send(reply, saveToSent = true)
+}
+```
+
+`send` returns an explicit outcome and never retries or resubmits, also not across reconnects:
+
+- `ACCEPTED`: the SMTP service accepted submission (not proof of delivery).
+- `FAILED`: definitely not sent.
+- `UNKNOWN`: the connection failed after DATA started. Look for the Message-ID in the Sent folder
+  before deciding to send again.
+
+```kotlin
+suspend fun sendAndInterpret(mailbox: Mailbox, draft: Draft) {
+    when (val result = checkNotNull(mailbox.outbox).send(draft)) {
+        is SendResult.Accepted -> println("Accepted; Sent copy stored: ${result.sentCopy != null}")
+        is SendResult.Failed -> println("Definitely not sent: ${result.cause.javaClass.simpleName}")
+        is SendResult.Unknown -> {
+            // Never resend blindly. Look for result.messageId in the Sent folder first.
+            val sent = mailbox.folders.special(SpecialUse.SENT)
+            println("Unknown outcome (${result.reason}); reconcile ${result.messageId} in ${sent?.name}")
+        }
+    }
+}
+```
+
+### Sent folder behavior
+
+With `saveToSent = true` MailKT appends a copy of an accepted message to the Sent folder found by
+its IMAP special-use attribute, but only for providers whose SMTP service does not store a copy
+itself (Gmail and Outlook do, so nothing is appended for them). The append is best effort, is not
+idempotent and can never trigger another submission; keep the accepted message in your own
+persistence regardless. `Folders.append` stores drafts or arbitrary messages explicitly:
+
+```kotlin
+suspend fun saveAsDraft(mailbox: Mailbox, draft: Draft): MessageLocation? {
+    val drafts = mailbox.folders.special(SpecialUse.DRAFTS) ?: return null
+    return mailbox.folders.append(drafts.path, draft, MessageFlags(draft = true))
+}
+```
+
+## Error handling
+
+Failures are typed subclasses of `MailException` with sanitized messages. Cancellation is never
+classified as a transport failure.
+
+```kotlin
+suspend fun readSafely(mailbox: Mailbox, location: MessageLocation) {
+    try {
+        val message = mailbox.messages.get(location)
+        println("Read message with ${message.attachments.size} attachments")
+    } catch (e: MailException.MessageUnavailable) {
+        println("Expunged or moved; skip it")
+    } catch (e: MailException.IntegrityViolation) {
+        println("UIDVALIDITY or part changed (${e.kind}); rescan the folder")
+    } catch (e: MailException.LimitExceeded) {
+        println("Larger than ${e.limitBytes} bytes")
+    } catch (e: MailException.NotConnected) {
+        println("Reconnecting (${e.state}); retry the operation later")
+    } catch (e: MailException.AuthenticationRequired) {
+        println("Send the user through the authorization flow again")
+    } catch (e: MailException.MailboxClosed) {
+        println("Mailbox was closed")
+    }
+}
+```
+
+```kotlin
+suspend fun listOrExplain(mailbox: Mailbox, folder: FolderPath) {
+    try {
+        mailbox.messages.page(MessageSelection(folder))
+    } catch (e: MailException.FolderNotFound) {
+        println("No such folder")
+    }
+}
+```
+
+## Logging
+
+MailKT logs through the SLF4J 2 API only, under dedicated categories (`dev.reapermaga.mailkt.lifecycle`,
+`.auth`, `.imap`, `.watch`, `.sync`, `.mime`, `.smtp`) with structured key/value fields and a stable
+one-way mailbox correlation ID. Addresses, tokens, authorization codes, headers, subjects,
+recipients, bodies, attachment names and provider error text are never logged. Configure routing and
+levels in your own logging backend.
+
+## Guarantees
+
+- Reads survive reconnects; scans keep their frozen snapshot and UIDVALIDITY integrity.
+- Downloads are bounded and never silently truncated.
+- Watchers are at-least-once with in-collection duplicate suppression.
+- Sending is never retried; outcomes are explicit.
+- Closing one mailbox never affects another.
 
 ## Build
 
@@ -397,15 +568,8 @@ On macOS/Linux:
 - Build: `./gradlew build`
 - Run all checks: `./gradlew check`
 
-## Notes
-
-- Provider sessions support OAuth2 only; the reusable `ImapMailSession` base can also be configured
-  for plain authentication.
-- Authentication and connection failures are thrown. Use `try/catch` at application boundaries
-  instead of inspecting nullable error fields.
-- `ReadMessagesResult` keeps its folder open so Jakarta `Message` instances remain usable; always
-  call its suspending `close` function.
+The build includes architecture checks (no Jakarta or Angus in public packages) and JDK 25 tests.
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT, see [LICENSE](LICENSE) for details.
