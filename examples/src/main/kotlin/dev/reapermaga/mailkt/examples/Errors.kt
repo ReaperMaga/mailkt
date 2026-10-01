@@ -25,7 +25,7 @@ suspend fun readSafely(mailbox: Mailbox, location: MessageLocation) {
         println("Mailbox was closed")
     }
 }
-// endregion
+// endregion errors
 
 // region folder-errors
 suspend fun listOrExplain(mailbox: Mailbox, folder: FolderPath) {
@@ -35,4 +35,4 @@ suspend fun listOrExplain(mailbox: Mailbox, folder: FolderPath) {
         println("No such folder")
     }
 }
-// endregion
+// endregion folder-errors

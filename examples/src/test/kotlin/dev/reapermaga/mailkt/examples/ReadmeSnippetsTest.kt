@@ -6,7 +6,8 @@ import kotlin.test.assertTrue
 
 /**
  * Keeps documentation from drifting: every Kotlin block in README.md must be an exact copy of a
- * `// region` of a compiled example source, so each README workflow is compile-tested.
+ * `// region` of a compiled example source, so each README workflow is compile-tested. The same
+ * regions are imported by the VitePress docs, which require the name on `// endregion <name>` too.
  */
 class ReadmeSnippetsTest {
     private val sources = File("src/main/kotlin")
@@ -21,7 +22,7 @@ class ReadmeSnippetsTest {
                 val t = line.trim()
                 when {
                     t.startsWith("// region ") -> { name = t.removePrefix("// region ").trim(); body.clear() }
-                    t == "// endregion" && name != null -> { result[name!!] = dedent(body); name = null }
+                    (t == "// endregion" || t.startsWith("// endregion ")) && name != null -> { result[name!!] = dedent(body); name = null }
                     name != null -> body += line
                 }
             }

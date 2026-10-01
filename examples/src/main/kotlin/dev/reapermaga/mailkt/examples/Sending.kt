@@ -15,7 +15,7 @@ suspend fun composeAndSend(mailbox: Mailbox, pdf: ByteArray): SendResult {
     // draft.messageId is assigned already: persist it BEFORE sending to reconcile an UNKNOWN outcome.
     return outbox.send(draft)
 }
-// endregion
+// endregion compose
 
 // region reply
 suspend fun replyToMessage(mailbox: Mailbox, original: MessageEnvelope): SendResult {
@@ -23,7 +23,7 @@ suspend fun replyToMessage(mailbox: Mailbox, original: MessageEnvelope): SendRes
     val reply = outbox.reply(original, replyAll = false, text = "Thank you, received.")
     return outbox.send(reply, saveToSent = true)
 }
-// endregion
+// endregion reply
 
 // region send-results
 suspend fun sendAndInterpret(mailbox: Mailbox, draft: Draft) {
@@ -37,11 +37,11 @@ suspend fun sendAndInterpret(mailbox: Mailbox, draft: Draft) {
         }
     }
 }
-// endregion
+// endregion send-results
 
 // region append-draft
 suspend fun saveAsDraft(mailbox: Mailbox, draft: Draft): MessageLocation? {
     val drafts = mailbox.folders.special(SpecialUse.DRAFTS) ?: return null
     return mailbox.folders.append(drafts.path, draft, MessageFlags(draft = true))
 }
-// endregion
+// endregion append-draft

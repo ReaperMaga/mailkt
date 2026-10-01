@@ -11,7 +11,7 @@ suspend fun discoverFolders(mailbox: Mailbox): FolderPath {
     println("Sent folder resolved: ${sent != null}")
     return checkNotNull(mailbox.folders.special(SpecialUse.INBOX)).path
 }
-// endregion
+// endregion folders
 
 // region paging
 suspend fun pageThroughInbox(mailbox: Mailbox, inbox: FolderPath): Int {
@@ -27,7 +27,7 @@ suspend fun pageThroughInbox(mailbox: Mailbox, inbox: FolderPath): Int {
     } while (checkpoint != null)
     return seen
 }
-// endregion
+// endregion paging
 
 // region history
 suspend fun streamHistory(mailbox: Mailbox, inbox: FolderPath, since: Instant) {
@@ -36,7 +36,7 @@ suspend fun streamHistory(mailbox: Mailbox, inbox: FolderPath, since: Instant) {
         println("UID ${envelope.location.uid} size=${envelope.advertisedSize}")
     }
 }
-// endregion
+// endregion history
 
 // region ingestion
 /** Envelope, then structure, then only the surviving parts: rejected mail costs no content download. */
@@ -53,7 +53,7 @@ suspend fun ingestInvoices(mailbox: Mailbox, inbox: FolderPath, senders: Set<Str
     }
     return pdfs
 }
-// endregion
+// endregion ingestion
 
 // region full-messages
 suspend fun readFullMessages(mailbox: Mailbox, inbox: FolderPath) {
@@ -61,4 +61,4 @@ suspend fun readFullMessages(mailbox: Mailbox, inbox: FolderPath) {
         println("Unread message with ${message.attachments.size} attachments; text length ${message.plainText?.length ?: 0}")
     }
 }
-// endregion
+// endregion full-messages

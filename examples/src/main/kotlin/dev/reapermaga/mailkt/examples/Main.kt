@@ -1,6 +1,8 @@
 package dev.reapermaga.mailkt.examples
 
 import dev.reapermaga.mailkt.client.use
+import dev.reapermaga.mailkt.gmail.Gmail
+import dev.reapermaga.mailkt.gmail.GmailConfig
 import dev.reapermaga.mailkt.model.AuthorizationCallback
 import dev.reapermaga.mailkt.model.MailAddress
 import dev.reapermaga.mailkt.model.SpecialUse
@@ -16,10 +18,10 @@ suspend fun main() {
     val env = Dotenv.load()
     val email = MailAddress(requireNotNull(env["GMAIL_ADDRESS"]))
     val redirect = URI("http://localhost:8080/oauth/gmail/callback")
-    val config = dev.reapermaga.mailkt.gmail.GmailConfig(
+    val config = GmailConfig(
         requireNotNull(env["GMAIL_CLIENT_ID"]), requireNotNull(env["GMAIL_CLIENT_SECRET"]), setOf(redirect),
     )
-    val gmail = dev.reapermaga.mailkt.gmail.Gmail(config, InMemoryTokenStore(), InMemoryAuthorizationSessionStore())
+    val gmail = Gmail(config, InMemoryTokenStore(), InMemoryAuthorizationSessionStore())
     println("Open: ${gmail.beginAuthorization(email, redirect).authorizationUrl}")
     print("code: ")
     val code = readln()

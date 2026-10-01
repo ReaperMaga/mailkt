@@ -15,7 +15,7 @@ suspend fun watchInbox(mailbox: Mailbox, inbox: FolderPath, saved: WatchCheckpoi
         // Persist watched.next only once your processing of this envelope is durable.
     }
 }
-// endregion
+// endregion watch-envelopes
 
 // region watch-messages
 suspend fun watchFullMessages(mailbox: Mailbox, inbox: FolderPath) {
@@ -23,4 +23,4 @@ suspend fun watchFullMessages(mailbox: Mailbox, inbox: FolderPath) {
         println("Received ${watched.message.attachments.size} attachments")
     }
 }
-// endregion
+// endregion watch-messages

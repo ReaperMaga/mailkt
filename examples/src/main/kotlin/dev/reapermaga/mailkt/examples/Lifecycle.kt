@@ -22,7 +22,7 @@ suspend fun openWithPolicy(gmail: Gmail, registry: MailboxRegistry): Mailbox {
     )
     return gmail.open(MailAddress("alice@gmail.com"), options)
 }
-// endregion
+// endregion lifecycle-open
 
 // region lifecycle-use
 suspend fun withMailbox(gmail: Gmail) {
@@ -30,7 +30,7 @@ suspend fun withMailbox(gmail: Gmail) {
         println("Connected as mailbox of ${mailbox.id.provider}")
     } // always closed, even on failure or cancellation
 }
-// endregion
+// endregion lifecycle-use
 
 // region lifecycle-states
 fun observeState(mailbox: Mailbox, scope: CoroutineScope) {
@@ -44,7 +44,7 @@ fun observeState(mailbox: Mailbox, scope: CoroutineScope) {
         }
     }.launchIn(scope)
 }
-// endregion
+// endregion lifecycle-states
 
 // region lifecycle-reconnect
 /** After the application completed a new hosted authorization, resume the same mailbox. */
@@ -57,11 +57,11 @@ suspend fun resumeAfterReauthorization(mailbox: Mailbox) {
         }
     }
 }
-// endregion
+// endregion lifecycle-reconnect
 
 // region lifecycle-registry
 suspend fun shutdown(registry: MailboxRegistry) {
     val report = registry.close() // closes all mailboxes concurrently
     report.failures.forEach { (id, _) -> println("Failed to close mailbox of ${id.provider}") }
 }
-// endregion
+// endregion lifecycle-registry

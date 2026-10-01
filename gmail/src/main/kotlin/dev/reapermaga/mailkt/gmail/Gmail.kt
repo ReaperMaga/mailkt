@@ -14,6 +14,7 @@ import dev.reapermaga.mailkt.model.AuthorizationRequest
 import dev.reapermaga.mailkt.model.MailAddress
 import dev.reapermaga.mailkt.model.MailException
 import dev.reapermaga.mailkt.model.MailboxId
+import dev.reapermaga.mailkt.model.RecoveryReason
 import dev.reapermaga.mailkt.model.TokenKey
 import kotlinx.coroutines.CancellationException
 import java.io.IOException
@@ -72,7 +73,7 @@ class Gmail internal constructor(
         } catch (e: GoogleTokenException) {
             throw MailException.AuthorizationFailed(AuthorizationFailure.EXCHANGE_FAILED, e)
         } catch (e: IOException) {
-            throw MailException.ConnectionFailed(dev.reapermaga.mailkt.model.RecoveryReason.NETWORK, e)
+            throw MailException.ConnectionFailed(RecoveryReason.NETWORK, e)
         }
         val claims = GmailIdentity.claims(tokens.idToken)
         val authenticated = claims?.email?.let { runCatching { MailAddress(it) }.getOrNull() }

@@ -12,7 +12,7 @@ suspend fun syncConversations(mailbox: Mailbox, inbox: FolderPath, saved: Conver
     sync.changed.forEach { println("Conversation with ${it.messages.size} messages, truncated=${it.truncated}") }
     return sync.next // persist after applying `changed`
 }
-// endregion
+// endregion conversations-sync
 
 // region conversation-of
 suspend fun readConversation(mailbox: Mailbox, location: MessageLocation) {
@@ -23,4 +23,4 @@ suspend fun readConversation(mailbox: Mailbox, location: MessageLocation) {
     val full = mailbox.messages.get(newest.location)
     println("Newest has ${full.attachments.size} attachments")
 }
-// endregion
+// endregion conversation-of

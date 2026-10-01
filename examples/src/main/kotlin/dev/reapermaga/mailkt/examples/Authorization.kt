@@ -23,7 +23,7 @@ fun gmailClient(tokens: InMemoryTokenStore, sessions: InMemoryAuthorizationSessi
     )
     return Gmail(config, tokens, sessions)
 }
-// endregion
+// endregion gmail-setup
 
 // region gmail-begin
 /** Backend endpoint: returns the URL the frontend navigates the browser to. */
@@ -34,7 +34,7 @@ suspend fun beginGmailAuthorization(gmail: Gmail, email: String): String {
     )
     return request.authorizationUrl.toString()
 }
-// endregion
+// endregion gmail-begin
 
 // region gmail-callback
 /** Backend route registered as the redirect URI: hand the query parameters to MailKT. */
@@ -43,7 +43,7 @@ suspend fun gmailCallback(gmail: Gmail, code: String?, state: String?, error: St
     println("Authorized mailbox of provider ${id.provider}")
     return gmail.open(MailAddress(requireNotNull(System.getenv("GMAIL_ADDRESS"))), MailboxOptions())
 }
-// endregion
+// endregion gmail-callback
 
 // region outlook-setup
 fun outlookClient(tokens: InMemoryTokenStore, sessions: InMemoryAuthorizationSessionStore): Outlook {
@@ -55,7 +55,7 @@ fun outlookClient(tokens: InMemoryTokenStore, sessions: InMemoryAuthorizationSes
     )
     return Outlook(config, tokens, sessions)
 }
-// endregion
+// endregion outlook-setup
 
 // region outlook-flow
 suspend fun outlookAuthorizeAndOpen(outlook: Outlook, email: String, code: String, state: String): Mailbox {
@@ -67,4 +67,4 @@ suspend fun outlookAuthorizeAndOpen(outlook: Outlook, email: String, code: Strin
     // 3. Open the mailbox using the stored tokens.
     return outlook.open(MailAddress(email))
 }
-// endregion
+// endregion outlook-flow

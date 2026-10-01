@@ -21,7 +21,7 @@ class InMemoryTokenStore : TokenStore {
         values.remove(key.storageKey)
     }
 }
-// endregion
+// endregion token-store
 
 // region session-store
 /** Demonstration only. A shared backend needs a store whose `consume` is atomic across instances. */
@@ -34,4 +34,4 @@ class InMemoryAuthorizationSessionStore : AuthorizationSessionStore {
 
     override suspend fun consume(state: String): PendingAuthorization? = pending.remove(state)
 }
-// endregion
+// endregion session-store

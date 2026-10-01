@@ -1,5 +1,8 @@
 # mailkt
 
+[![CI](https://github.com/ReaperMaga/mailkt/actions/workflows/ci.yaml/badge.svg)](https://github.com/ReaperMaga/mailkt/actions/workflows/ci.yaml)
+[![Docs](https://img.shields.io/badge/docs-reapermaga.github.io%2Fmailkt-d97757)](https://reapermaga.github.io/mailkt/)
+
 Coroutine-first Kotlin/JVM library for reading, watching and sending email through a managed
 `Mailbox`, with hosted OAuth2 for Gmail and Outlook (Microsoft 365). MailKT runs entirely in your
 backend process; it never opens a browser, starts an HTTP listener or persists anything itself.
@@ -16,6 +19,8 @@ Highlights:
 - Explicit send outcomes (`ACCEPTED`, `FAILED`, `UNKNOWN`), never retried automatically.
 - No built-in persistence: tokens, pending authorizations and checkpoints cross small interfaces or
   return values that you store.
+
+Full documentation: **https://reapermaga.github.io/mailkt/**
 
 ## Modules
 
