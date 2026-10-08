@@ -26,13 +26,16 @@ internal class AngusImapFolder(
     override val uidValidity: Long = folder.uidValidity
     override val uidNext: Long = folder.uidNext
 
-    private suspend fun <T> io(body: () -> T): T = runInterruptible(Dispatchers.IO) {
-        try {
-            body()
-        } catch (e: IllegalStateException) {
-            // Angus can surface a folder-close race as IllegalStateException; classify it as closure.
-            if (!folder.isOpen) throw FolderClosedException(folder, "Folder closed") else throw e
-        }
+    private suspend fun <T> io(body: () -> T): T = runInterruptible(Dispatchers.IO) { closureAware(body) }
+
+    /**
+     * Angus reports an operation on a folder that a reconnect just closed as a plain IllegalStateException; it is
+     * rethrown as [FolderClosedException], so it counts as a recoverable connection loss rather than a fatal failure.
+     */
+    private inline fun <T> closureAware(body: () -> T): T = try {
+        body()
+    } catch (e: IllegalStateException) {
+        if (!folder.isOpen) throw FolderClosedException(folder, "Folder closed") else throw e
     }
 
     private fun location(uid: Long) = MessageLocation(id, path, uidValidity, uid)
@@ -161,7 +164,8 @@ internal class AngusImapFolder(
     }
 
     private suspend fun idleOnce(timeoutMillis: Long) = coroutineScope {
-        val worker = launch(Dispatchers.IO) { folder.idle(true) }
+        // Not interruptible like [io]: IDLE is ended by the NOOP below, which also covers timeout and cancellation.
+        val worker = launch(Dispatchers.IO) { closureAware { folder.idle(true) } }
         try {
             withTimeoutOrNull(timeoutMillis) { worker.join() }
         } finally {
